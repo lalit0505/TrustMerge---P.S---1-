@@ -35,6 +35,22 @@ class NoteRecord:
         return cls(level=d["level"], evidence=d["evidence"])
 
 
+def normalize_record(raw: object) -> Optional[NoteRecord]:
+    """Validate and normalize a raw record into NoteRecord, or None if invalid."""
+    if not isinstance(raw, dict):
+        return None
+    lvl = raw.get("level")
+    if not isinstance(lvl, str):
+        return None
+    norm_lvl = lvl.strip().upper().replace("_", "-")
+    if norm_lvl not in RECORDABLE:
+        return None
+    ev = raw.get("evidence")
+    if not isinstance(ev, str) or not ev.strip():
+        return None
+    return NoteRecord(level=norm_lvl, evidence=ev.strip())
+
+
 # ── read / write notes ────────────────────────────────────────────────
 
 
@@ -46,10 +62,15 @@ def read_note(repo: Path, sha: str) -> Optional[list[NoteRecord]]:
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                return [NoteRecord(level="CI-PASSED", evidence=raw.strip())]
+                # Free-text notes must NOT become CI-PASSED; ignore them
+                continue
             if isinstance(data, dict):
                 data = [data]
-            return [NoteRecord.from_dict(d) for d in data]
+            elif not isinstance(data, list):
+                continue
+            records = [r for item in data if (r := normalize_record(item)) is not None]
+            if records:
+                return records
     return None
 
 
@@ -58,12 +79,15 @@ def write_note(repo: Path, sha: str, record: NoteRecord) -> None:
     norm_level = record.level.upper().replace("_", "-")
     if norm_level not in RECORDABLE:
         raise ValueError(f"level must be one of {RECORDABLE}, got {record.level!r}")
+    if not isinstance(record.evidence, str) or not record.evidence.strip():
+        raise ValueError("evidence must be a non-empty string")
+    norm_rec = NoteRecord(level=norm_level, evidence=record.evidence.strip())
+
     sha = rev_parse(repo, sha)
     existing = read_note(repo, sha) or []
-    norm_record = NoteRecord(level=norm_level, evidence=record.evidence)
-    if norm_record in existing:
+    if norm_rec in existing:
         return
-    entries = [r.to_dict() for r in existing] + [norm_record.to_dict()]
+    entries = [r.to_dict() for r in existing] + [norm_rec.to_dict()]
     blob = json.dumps(entries, indent=2)
     run_git(
         repo, "notes", "--ref", NOTES_REF, "add", "-f", "-m", blob, sha,
@@ -75,6 +99,7 @@ def write_note(repo: Path, sha: str, record: NoteRecord) -> None:
 
 def read_evidence_file(repo: Path, sha: str) -> Optional[list[NoteRecord]]:
     """Read recorded evidence from .trustmerge/evidence.json or .gitprov/evidence.json."""
+    sha = rev_parse(repo, sha).lower()
     for subpath in (".trustmerge/evidence.json", ".gitprov/evidence.json"):
         path = Path(repo) / subpath
         if not path.is_file():
@@ -84,22 +109,33 @@ def read_evidence_file(repo: Path, sha: str) -> Optional[list[NoteRecord]]:
         except (json.JSONDecodeError, OSError):
             continue
 
+        records: list[NoteRecord] = []
         if isinstance(content, dict):
             for k, val in content.items():
-                if sha.startswith(k) or k.startswith(sha):
-                    if isinstance(val, dict):
-                        lvl = val.get("level", "CI-PASSED").upper().replace("_", "-")
-                        return [NoteRecord(level=lvl, evidence=val.get("evidence", ""))]
-                    elif isinstance(val, str):
-                        return [NoteRecord(level="CI-PASSED", evidence=val)]
+                if not isinstance(k, str) or len(k.strip()) < 7:
+                    continue
+                k_clean = k.strip().lower()
+                # match with sha.startswith(key) only
+                if sha.startswith(k_clean):
+                    rec = normalize_record(val)
+                    if rec is not None:
+                        records.append(rec)
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict):
-                    item_sha = item.get("sha", "")
-                    if item_sha and (sha.startswith(item_sha) or item_sha.startswith(sha)):
-                        lvl = item.get("level", "CI-PASSED").upper().replace("_", "-")
-                        return [NoteRecord(level=lvl, evidence=item.get("evidence", ""))]
+                    item_sha = item.get("sha")
+                    if not isinstance(item_sha, str) or len(item_sha.strip()) < 7:
+                        continue
+                    k_clean = item_sha.strip().lower()
+                    # match with sha.startswith(key) only
+                    if sha.startswith(k_clean):
+                        rec = normalize_record(item)
+                        if rec is not None:
+                            records.append(rec)
+        if records:
+            return records
     return None
+
 
 
 def get_recorded_evidence(repo: Path, sha: str) -> list[NoteRecord]:

@@ -105,15 +105,17 @@ def assess(repo: Path, sha: str, config: Config = Config()) -> Evidence:
     sha = rev_parse(repo, sha)
     inferred = infer_evidence(repo, sha, config)
     recorded = get_recorded_evidence(repo, sha)
-    if not recorded:
+    valid_recorded = [r for r in recorded if rank(r.level) < 999]
+    if not valid_recorded:
         return inferred
 
     # Pick the strongest recorded evidence
     best = min(
-        recorded,
-        key=lambda r: rank(r.level.upper()) if r.level.upper() in LEVEL_ORDER else 999,
+        valid_recorded,
+        key=lambda r: rank(r.level),
     )
-    rec_level = best.level.upper()
+    rec_level = best.level.upper().replace("_", "-")
+
 
     if rank(rec_level) <= rank(inferred.level):
         return Evidence(

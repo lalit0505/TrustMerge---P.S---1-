@@ -251,6 +251,8 @@ In CI or headless environments, set `TRUSTMERGE_LLM=fake` (configured automatica
 1. **Squashed or Rewritten Commits without Metadata**: If a commit was squashed without preserving trailers or modified beyond recognition, TrustMerge defaults to `UNVERIFIED` rather than guessing.
 2. **Untracked Branches**: TrustMerge inspects standard branch names (`prod`, `uat`, `dev` by default). Custom branch names can be configured via `trustmerge.provenance.Config`.
 3. **Local LLM Availability**: When Ollama is offline or uninstalled, TrustMerge transparently falls back to deterministic rule-based recommendations without failing.
+4. **Recorded Evidence is Unsigned and Trust-on-Push**: Recorded evidence stored in `refs/notes/trustmerge` and local evidence files is unsigned and trust-on-push: anyone with push access to the repository can attach or edit notes under `refs/notes/trustmerge`. For cryptographic auditability, verify notes in CI against signed build provenance.
+
 
 ---
 
