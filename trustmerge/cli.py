@@ -1,6 +1,6 @@
 import typer
 
-from trustmerge import notes, scan
+from trustmerge import notes, report, scan
 
 app = typer.Typer(
     help="TrustMerge: conflict provenance for Git.", no_args_is_help=True
@@ -22,3 +22,4 @@ def version() -> None:
 
 scan.register(app)
 notes.register(app)
+report.register(app)
