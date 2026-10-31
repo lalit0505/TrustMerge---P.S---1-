@@ -335,4 +335,67 @@ def test_regression_b5_binary_conflict_no_crash(tmp_path):
     assert "binary conflict: cannot show hunks" in hunk.ours.lines[0]
 
 
+def test_regression_b6_rebase_conflict_detection(tmp_path):
+    import subprocess
+    from rich.console import Console
+    from trustmerge.report import build_conflict_report, render_report
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    run("init", "-b", "main")
+    run("config", "user.name", "Test")
+    run("config", "user.email", "test@example.com")
+    run("config", "commit.gpgsign", "false")
+
+    (repo / "file.txt").write_text("line 1\nbase line\nline 3\n")
+    run("add", "file.txt")
+    run("commit", "-m", "Base commit")
+
+    # Feature branch (which will be rebased)
+    run("checkout", "-b", "feature")
+    (repo / "file.txt").write_text("line 1\nfeature change\nline 3\n")
+    run("add", "file.txt")
+    run("commit", "-m", "Feature commit")
+    feature_sha = run("rev-parse", "HEAD").stdout.strip()
+
+    # Main branch (target/upstream)
+    run("checkout", "main")
+    (repo / "file.txt").write_text("line 1\nupstream change\nline 3\n")
+    run("add", "file.txt")
+    run("commit", "-m", "Upstream commit")
+    upstream_sha = run("rev-parse", "HEAD").stdout.strip()
+
+    # Rebase feature onto main -> conflicts!
+    run("checkout", "feature")
+    subprocess.run(["git", "rebase", "main"], cwd=repo, capture_output=True)
+
+    assert is_conflicted(repo) is True
+    op = get_conflict_type(repo)
+    assert op == "rebase"
+    theirs = get_theirs_head(repo)
+    assert theirs is not None
+    assert theirs == feature_sha
+
+    state = find_conflicts(repo)
+    assert state is not None
+    assert state.operation == "rebase"
+    assert state.theirs_head == feature_sha
+
+    report = build_conflict_report(repo, use_llm=False)
+    assert report is not None
+    assert report.operation == "rebase"
+
+    console = Console(record=True, color_system=None)
+    render_report(report, console=console)
+    output = console.export_text()
+    assert "swapped" in output.lower() or "upstream" in output.lower()
+
+
+
 

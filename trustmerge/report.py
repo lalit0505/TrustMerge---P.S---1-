@@ -310,15 +310,21 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
 
     console.print()
     header_title = f"TrustMerge Conflict Analysis ({report.operation.upper()})"
+    rebase_note = ""
+    if report.operation == "rebase":
+        rebase_note = "\n[yellow]Note: During rebase, OURS is upstream/target and THEIRS is your rebased commit (swapped by Git).[/]"
+
     console.print(
         Panel(
             f"Conflict between OURS ([cyan]{short(report.ours_head)}[/]) and "
             f"THEIRS ([magenta]{short(report.theirs_head or 'unknown')}[/])\n"
-            f"Conflicted hunks: {len(report.hunks)}",
+            f"Conflicted hunks: {len(report.hunks)}"
+            f"{rebase_note}",
             title=f"[bold]{header_title}[/]",
             border_style="bold blue",
         )
     )
+
 
     for idx, hunk in enumerate(report.hunks, 1):
         table = Table(

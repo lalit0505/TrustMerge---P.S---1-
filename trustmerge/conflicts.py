@@ -56,11 +56,21 @@ class ConflictState:
 
 
 def get_theirs_head(repo: Path) -> Optional[str]:
-    """Return the incoming commit SHA for merge, cherry-pick, or revert."""
-    for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+    """Return the incoming commit SHA for merge, cherry-pick, revert, or rebase."""
+    for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
         out = run_git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
         if out:
             return out
+
+    # Check rebase-merge / rebase-apply stopped-sha
+    for subpath in ("rebase-merge/stopped-sha", "rebase-apply/stopped-sha"):
+        git_path_rel = run_git(repo, "rev-parse", "--git-path", subpath, check=False).strip()
+        if git_path_rel:
+            f = Path(repo) / git_path_rel
+            if f.is_file():
+                sha = f.read_text(encoding="utf-8", errors="replace").strip()
+                if sha:
+                    return sha
     return None
 
 
@@ -72,7 +82,14 @@ def get_conflict_type(repo: Path) -> str:
         return "cherry-pick"
     if run_git(repo, "rev-parse", "--verify", "--quiet", "REVERT_HEAD", check=False):
         return "revert"
+    if run_git(repo, "rev-parse", "--verify", "--quiet", "REBASE_HEAD", check=False):
+        return "rebase"
+    for rdir in ("rebase-merge", "rebase-apply"):
+        git_path_rel = run_git(repo, "rev-parse", "--git-path", rdir, check=False).strip()
+        if git_path_rel and (Path(repo) / git_path_rel).is_dir():
+            return "rebase"
     return "conflict"
+
 
 
 def list_conflicted_paths(repo: Path) -> list[str]:
@@ -166,7 +183,11 @@ def _map_hunk_range(
 
 
 def parse_conflicted_file(
-    repo: Path, file_path: str, ours_head: str, theirs_head: Optional[str]
+    repo: Path,
+    file_path: str,
+    ours_head: str,
+    theirs_head: Optional[str],
+    operation: str = "conflict",
 ) -> ConflictedFile:
     """Parse conflict markers in *file_path* and attribute each side via git blame."""
     disk_file = Path(repo) / file_path
@@ -227,7 +248,6 @@ def parse_conflicted_file(
             stage3_content=stage3,
         )
 
-
     try:
         raw_lines = disk_file.read_text(errors="replace").splitlines()
     except OSError:
@@ -241,8 +261,11 @@ def parse_conflicted_file(
     ours_lines: list[str] = []
     theirs_lines: list[str] = []
     base_lines: list[str] = []
-    ours_label = "HEAD"
-    theirs_label = theirs_head or "theirs"
+    ours_label = "HEAD (upstream)" if operation == "rebase" else "HEAD"
+    theirs_label = (
+        f"{theirs_head[:8]} (rebased)" if (theirs_head and operation == "rebase")
+        else ("rebased" if operation == "rebase" else (theirs_head or "theirs"))
+    )
     w_ours_start = 0
     w_ours_end = 0
     w_theirs_start = 0
@@ -259,7 +282,11 @@ def parse_conflicted_file(
             theirs_lines = []
             base_lines = []
             parts = line.split(maxsplit=1)
-            ours_label = parts[1].strip() if len(parts) > 1 else "HEAD"
+            raw_label = parts[1].strip() if len(parts) > 1 else "HEAD"
+            if operation == "rebase" and "upstream" not in raw_label:
+                ours_label = f"{raw_label} (upstream)"
+            else:
+                ours_label = raw_label
             w_ours_start = idx + 1
             w_ours_end = idx + 1
         # ||||||| is valid only inside ours
@@ -286,7 +313,12 @@ def parse_conflicted_file(
             in_theirs = False
             w_theirs_end = idx
             parts = line.split(maxsplit=1)
-            theirs_label = parts[1].strip() if len(parts) > 1 else (theirs_head or "theirs")
+            raw_theirs = parts[1].strip() if len(parts) > 1 else (theirs_head or "theirs")
+            if operation == "rebase" and "rebased" not in raw_theirs:
+                theirs_label = f"{raw_theirs} (rebased commit)"
+            else:
+                theirs_label = raw_theirs
+
 
             # Map line ranges into stage2 and stage3
             ours_start, ours_end = _map_hunk_range(raw_lines, stage2_lines, w_ours_start, w_ours_end)
@@ -359,7 +391,9 @@ def find_conflicts(repo: Path) -> Optional[ConflictState]:
     operation = get_conflict_type(repo)
 
     files = [
-        parse_conflicted_file(repo, p, ours_head=ours_head, theirs_head=theirs_head)
+        parse_conflicted_file(
+            repo, p, ours_head=ours_head, theirs_head=theirs_head, operation=operation
+        )
         for p in paths
     ]
 
@@ -369,3 +403,4 @@ def find_conflicts(repo: Path) -> Optional[ConflictState]:
         ours_head=ours_head,
         theirs_head=theirs_head,
     )
+
