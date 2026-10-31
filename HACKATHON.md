@@ -14,8 +14,7 @@ Problem 1: Intelligent Git Conflict Resolution with Testing Provenance
 ## AI models used
 | Model | How we run it | What it does | Why |
 |---|---|---|---|
-| gemma4:e4b | Ollama, running locally | In the product: judges whether two patches are the same change, extracts references from commit messages, and explains conflicts from collected evidence | Open weights, runs on a laptop, reliable structured JSON output |
-| qwen2.5-coder:7b | Ollama, running locally | Development only: generates implementation code through Aider | Strong small open-weight coder that fits laptop memory |
+| qwen2.5-coder:7b | Ollama, running locally | In the product: judges whether two patches are the same change, extracts references from commit messages, and explains conflicts from collected evidence | Open weights, runs on a laptop, reliable structured JSON output |
 
 ## AI coding assistants
 Aider with qwen2.5-coder:7b (via Ollama) writes most implementation code. Claude (claude.ai chat) wrote the scaffold, test suites and specs.

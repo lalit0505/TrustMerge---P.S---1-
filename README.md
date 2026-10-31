@@ -39,7 +39,7 @@ When a patch is backported, cherry-picked, or edited during conflict resolution,
 3. Overlapping Files & Modified Hunks
         │ (ambiguous candidates)
         ▼
-4. Open-Source AI Judge (Qwen 2.5 / Gemma via Ollama)
+4. Open-Source AI Judge (qwen2.5-coder:7b via Ollama)
    - Temperature 0, 16k context
    - Validated JSON verdict: `SameChangeVerdict(same_change=bool, confidence=float, reasoning=str)`
 ```
@@ -83,7 +83,7 @@ TrustMerge assigns strict evidence levels in decreasing order of confidence:
 
 ## Open-Source AI Integration
 
-TrustMerge uses **Qwen 2.5 / Gemma** running locally via Ollama (`http://localhost:11434`):
+TrustMerge uses **qwen2.5-coder:7b** running locally via Ollama (`http://localhost:11434`):
 1. **Fuzzy Same-Change Judge**: Evaluates ambiguous code hunks across branches where patch-IDs and trailers differ.
 2. **Messy Message Reference Extractor**: Turns conversational or unstructured commit messages into structured commit hashes and PR numbers when regexes fail.
 3. **Evidence-Bounded Conflict Briefing**: Generates a plain-English briefing for the developer. The prompt strictly instructs the model: *"Never claim something is tested without evidence. If the evidence doesn't say it's tested, say it's unverified."*
@@ -96,7 +96,7 @@ TrustMerge uses **Qwen 2.5 / Gemma** running locally via Ollama (`http://localho
 ### Prerequisites
 - Python 3.10+
 - Git 2.30+
-- (Optional) [Ollama](https://ollama.ai) with `qwen2.5-coder:7b` or `gemma4:e4b` for live AI briefings.
+- (Optional) [Ollama](https://ollama.ai) with `qwen2.5-coder:7b` for live AI briefings.
 
 ### Install from source
 ```bash
