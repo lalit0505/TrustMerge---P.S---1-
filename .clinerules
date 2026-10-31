@@ -1,0 +1,10 @@
+Project: TrustMerge, a Python Git extension (package trustmerge, commands trustmerge and git-trustmerge).
+Stack: Python 3.12, typer, rich, pydantic, httpx, pytest. Call git via subprocess only.
+Rules:
+- Small changes only: one function or file per task.
+- Every function gets a pytest test in tests/.
+- Never claim a change is tested without evidence; return UNKNOWN instead.
+- All LLM calls go through trustmerge/llm.py, with a fake client for tests (TRUSTMERGE_LLM=fake).
+- Provenance is stored in git notes under refs/notes/trustmerge.
+- No secrets in the repo. No network calls except to localhost Ollama.
+- Run pytest -q before finishing any task.
