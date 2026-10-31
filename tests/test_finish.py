@@ -207,3 +207,43 @@ def test_regression_a1_claim_capping_and_force_claim(scenario):
     notes = read_note(repo, new_sha)
     assert notes[0].level == "UAT"
 
+
+def test_regression_b7_docs_containing_marker_strings_not_blocked(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+
+    # Resolve settings.py
+    (repo / "settings.py").write_text("DEBUG = False\nTIMEOUT = 60\n")
+    git(repo, "add", "settings.py")
+
+    # Add a documentation file mentioning conflict markers inside comments/quotes
+    doc_content = (
+        "# Documentation about merge conflicts\n"
+        "# Conflict markers look like:\n"
+        "#   <<<<<<< HEAD\n"
+        "#   =======\n"
+        "#   >>>>>>> branch\n"
+        "def example():\n"
+        "    msg = '<<<<<<< not a real marker ======= >>>>'\n"
+    )
+    (repo / "doc.txt").write_text(doc_content)
+    git(repo, "add", "doc.txt")
+
+    # This must NOT raise "Unresolved conflict markers remain"
+    new_sha = finish_conflict(repo=repo, message="Resolve with docs")
+    assert new_sha is not None
+
+
+def test_regression_b7_all_flag_prints_staged_files(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+
+    (repo / "settings.py").write_text("DEBUG = False\nTIMEOUT = 60\n")
+
+    res = runner.invoke(app, ["finish", "--all", "--repo", str(repo)])
+    assert res.exit_code == 0
+    # Must list staged files
+    assert "settings.py" in res.output
+    assert "Staged" in res.output or "staged" in res.output
+
+

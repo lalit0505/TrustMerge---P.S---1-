@@ -166,6 +166,21 @@ def _get_kept_commits(
     return kept_commits or [ours_head]
 
 
+def _git_path(repo: Path, name: str) -> Path:
+    """Return worktree-safe path for a git metadata file."""
+    rel = run_git(repo, "rev-parse", "--git-path", name, check=False).strip()
+    if not rel:
+        return Path(repo) / ".git" / name
+    p = Path(rel)
+    return p if p.is_absolute() else Path(repo) / p
+
+
+MARKER_SEQUENCE_RE = re.compile(
+    r"^<<<<<<< [^\r\n]*\r?\n.*?\r?\n^=======\r?\n.*?\r?\n^>>>>>>> [^\r\n]*",
+    re.MULTILINE | re.DOTALL,
+)
+
+
 def finish_conflict(
     repo: Path,
     message: Optional[str] = None,
@@ -180,7 +195,21 @@ def finish_conflict(
     Returns the new commit hash.
     """
     if add_all:
+        pre = set(
+            f.strip()
+            for f in run_git(repo, "diff", "--cached", "--name-only", check=False).splitlines()
+            if f.strip()
+        )
         run_git(repo, "add", "-A")
+        post = set(
+            f.strip()
+            for f in run_git(repo, "diff", "--cached", "--name-only", check=False).splitlines()
+            if f.strip()
+        )
+        newly_staged = sorted(post - pre)
+        files_to_report = newly_staged if newly_staged else sorted(post)
+        if files_to_report:
+            typer.echo(f"Staged {len(files_to_report)} file(s): {', '.join(files_to_report)}")
 
     if is_conflicted(repo):
         unmerged = list_conflicted_paths(repo)
@@ -193,13 +222,13 @@ def finish_conflict(
     staged_output = run_git(repo, "diff", "--cached", "--name-only", check=False)
     staged_files = [f.strip() for f in staged_output.splitlines() if f.strip()]
 
-    # Verify no unresolved conflict markers were accidentally staged
+    # Verify no unresolved conflict markers were accidentally staged (real marker sequence at line start)
     for rel_path in staged_files:
         fpath = Path(repo) / rel_path
         if fpath.is_file():
             try:
                 content = fpath.read_text(errors="replace")
-                if "<<<<<<<" in content and "=======" in content and ">>>>>>>" in content:
+                if MARKER_SEQUENCE_RE.search(content):
                     raise GitError(
                         f"Unresolved conflict markers remain inside {rel_path}.", stderr=""
                     )
@@ -207,10 +236,11 @@ def finish_conflict(
                 pass
 
     theirs_head = get_theirs_head(repo)
-    merge_head_file = Path(repo) / ".git" / "MERGE_HEAD"
-    cherry_pick_head_file = Path(repo) / ".git" / "CHERRY_PICK_HEAD"
+    merge_head_file = _git_path(repo, "MERGE_HEAD")
+    cherry_pick_head_file = _git_path(repo, "CHERRY_PICK_HEAD")
+    rebase_head_file = _git_path(repo, "REBASE_HEAD")
 
-    is_merging = merge_head_file.is_file() or cherry_pick_head_file.is_file()
+    is_merging = merge_head_file.is_file() or cherry_pick_head_file.is_file() or rebase_head_file.is_file()
     if not staged_files and not is_merging:
         raise GitError("No staged changes to commit.", stderr="")
 
@@ -253,16 +283,18 @@ def finish_conflict(
     if message and message.strip():
         base_msg = message.strip()
     else:
-        merge_msg_file = Path(repo) / ".git" / "MERGE_MSG"
+        merge_msg_file = _git_path(repo, "MERGE_MSG")
         if merge_msg_file.is_file():
             clean_lines = [
-                l for l in merge_msg_file.read_text().splitlines() if not l.startswith("#")
+                l for l in merge_msg_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                if not l.startswith("#")
             ]
             base_msg = "\n".join(clean_lines).strip() or "Resolve conflict"
         elif theirs_head:
             base_msg = f"Resolve conflict with {theirs_head[:8]}"
         else:
             base_msg = "Resolve conflict"
+
 
     # Determine trailers
     if not provenance:
