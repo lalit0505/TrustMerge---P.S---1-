@@ -9,8 +9,12 @@ from typing import Optional
 from trustmerge.git import GitError, patch_id, rev_parse, run_git
 
 _HASH_PATTERNS = [
-    re.compile(r"cherry picked from commit ([0-9a-f]{7,40})"),
-    re.compile(r"Backport of ([0-9a-f]{7,40})"),
+    re.compile(r"cherry[ -]picked from commit ([0-9a-f]{7,40})", re.IGNORECASE),
+    re.compile(r"cherry-picked from:?\s+([0-9a-f]{7,40})", re.IGNORECASE),
+    re.compile(r"Backport(?:ed)? of (?:commit )?([0-9a-f]{7,40})", re.IGNORECASE),
+    re.compile(r"\[\s*upstream commit ([0-9a-f]{7,40})\s*\]", re.IGNORECASE),
+    re.compile(r"commit ([0-9a-f]{7,40}) upstream", re.IGNORECASE),
+    re.compile(r"(?:origin|upstream):\s+([0-9a-f]{7,40})", re.IGNORECASE),
 ]
 _PR_PATTERN = re.compile(r"\bGH-\d+\b")
 
@@ -22,7 +26,11 @@ class Match:
     method: str  # "patch-id", "reference", or "llm-judge"
 
 
-def extract_references(message: str) -> list[str]:
+def extract_references(
+    message: str,
+    use_llm: bool = False,
+    client: Optional["LLMClient"] = None,
+) -> list[str]:
     """Return commit hashes and GH-<number> references in order of first appearance."""
     found: list[tuple[int, str]] = []
     for pattern in _HASH_PATTERNS:
@@ -32,6 +40,21 @@ def extract_references(message: str) -> list[str]:
     for _, ref in sorted(found):
         if ref not in refs:
             refs.append(ref)
+
+    if not refs and use_llm:
+        keywords = ("backport", "cherry", "picked", "upstream", "sync", "ported", "origin")
+        if any(kw in message.lower() for kw in keywords):
+            from trustmerge.llm import get_llm_client
+
+            llm = client or get_llm_client()
+            extracted = llm.extract_references_from_message(message)
+            for h in extracted.commit_hashes:
+                if h not in refs:
+                    refs.append(h)
+            for pr in extracted.pr_numbers:
+                if pr not in refs:
+                    refs.append(pr)
+
     return refs
 
 
@@ -100,7 +123,9 @@ def find_equivalents(
     from trustmerge.llm import get_llm_client, LLMClient
 
     sha = rev_parse(repo, sha)
-    sha_refs = extract_references(run_git(repo, "log", "-1", "--format=%B", sha))
+    sha_refs = extract_references(
+        run_git(repo, "log", "-1", "--format=%B", sha), use_llm=use_llm, client=client
+    )
     try:
         sha_pid = patch_id(repo, sha)
     except (GitError, IndexError):
@@ -118,9 +143,10 @@ def find_equivalents(
         for cand, message in _commits(repo, branch, max_commits):
             if cand == sha:
                 continue
+            cand_refs = extract_references(message, use_llm=use_llm, client=client)
             if sha_pid is not None and pids.get(cand) == sha_pid:
                 method = "patch-id"
-            elif _related(sha, sha_refs, cand, extract_references(message)):
+            elif _related(sha, sha_refs, cand, cand_refs):
                 method = "reference"
             elif use_llm:
                 cand_files = set(
