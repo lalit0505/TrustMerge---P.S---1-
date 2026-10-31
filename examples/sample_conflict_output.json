@@ -1,0 +1,62 @@
+{
+  "operation": "merge",
+  "ours_head": "34a438a6f21574d5a45f76b952c80801cc2f6beb",
+  "theirs_head": "330c642a220c4737cf5dcb987b42ef5789961b87",
+  "hunks": [
+    {
+      "file_path": "settings.py",
+      "ours": {
+        "label": "HEAD",
+        "lines": [
+          "TIMEOUT = 60"
+        ],
+        "commits": [
+          {
+            "sha": "34a438a6f21574d5a45f76b952c80801cc2f6beb",
+            "short_sha": "34a438a6",
+            "subject": "Fix slow upstream timeout (hotfix #812)",
+            "level": "UAT",
+            "source": "inferred",
+            "detail": "reachable from uat",
+            "reached": [
+              "uat"
+            ],
+            "related": [
+              "same logical change as 663880a4 on prod (code may differ, verify separately)"
+            ]
+          }
+        ],
+        "best_level": "UAT"
+      },
+      "theirs": {
+        "label": "dev",
+        "lines": [
+          "TIMEOUT = 45"
+        ],
+        "commits": [
+          {
+            "sha": "330c642a220c4737cf5dcb987b42ef5789961b87",
+            "short_sha": "330c642a",
+            "subject": "Tune timeout (PR #845)",
+            "level": "UNVERIFIED",
+            "source": "inferred",
+            "detail": "only on dev; no evidence it was tested",
+            "reached": [
+              "dev"
+            ],
+            "related": []
+          }
+        ],
+        "best_level": "UNVERIFIED"
+      },
+      "recommendation": "Merge the `HEAD` version of `settings.py` with a `TIMEOUT` of 60, as it is verified through UAT testing.",
+      "briefing": {
+        "summary": "There is a conflict in the `settings.py` file regarding the `TIMEOUT` variable. The current code in the `HEAD` (OURS) has a `TIMEOUT` of 60, which is based on UAT testing. The code in the `dev` branch (THEIRS) has a `TIMEOUT` of 45, which has no evidence of testing.",
+        "ours_assessment": "The `TIMEOUT` of 60 is based on UAT testing, making it verified.",
+        "theirs_assessment": "The `TIMEOUT` of 45 is unverified as there is no evidence it was tested.",
+        "recommendation": "Merge the `HEAD` version of `settings.py` with a `TIMEOUT` of 60, as it is verified through UAT testing.",
+        "reasoning": "The `HEAD` version has evidence of being tested in UAT, while the `dev` version lacks any evidence of testing. Therefore, the `HEAD` version should be preferred."
+      }
+    }
+  ]
+}
