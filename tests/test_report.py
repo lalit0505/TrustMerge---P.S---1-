@@ -1,4 +1,4 @@
-"""Tests for trustmerge.report: conflict analysis, rich display, and recommendations."""
+"""Tests for trustmerge.report: conflict analysis, rich display, recommendations, and LLM briefings."""
 
 import json
 from pathlib import Path
@@ -10,6 +10,7 @@ from fixtures import git, start_conflict
 from trustmerge.cli import app
 from trustmerge.conflicts import find_conflicts
 from trustmerge.levels import CI_PASSED, PROD, UAT, UNKNOWN, UNVERIFIED
+from trustmerge.llm import ConflictBriefing, FakeLLMClient
 from trustmerge.report import (
     CommitAnalysis,
     ConflictReport,
@@ -101,9 +102,10 @@ def test_build_conflict_report_clean_repo(scenario):
     assert build_conflict_report(scenario.repo) is None
 
 
-def test_build_conflict_report_on_merge_conflict(scenario):
+def test_build_conflict_report_with_fake_llm_briefing(scenario):
     start_conflict(scenario)
-    report = build_conflict_report(scenario.repo)
+    fake_client = FakeLLMClient()
+    report = build_conflict_report(scenario.repo, use_llm=True, client=fake_client)
 
     assert report is not None
     assert report.operation == "merge"
@@ -114,12 +116,22 @@ def test_build_conflict_report_on_merge_conflict(scenario):
     assert hunk.file_path == "settings.py"
     assert hunk.ours.best_level == UAT
     assert hunk.theirs.best_level == UNVERIFIED
-    assert "Recommend OURS" in hunk.recommendation
+    assert hunk.briefing is not None
+    assert "Conflict in settings.py" in hunk.briefing.summary
+    assert "Never claim code is tested without recorded evidence" in hunk.briefing.reasoning
 
     # Dictionary serializable
     d = report_to_dict(report)
     assert d["operation"] == "merge"
-    assert d["hunks"][0]["ours"]["best_level"] == "UAT"
+    assert d["hunks"][0]["briefing"]["summary"] == hunk.briefing.summary
+
+
+def test_build_conflict_report_no_llm(scenario):
+    start_conflict(scenario)
+    report = build_conflict_report(scenario.repo, use_llm=False)
+    assert report is not None
+    assert report.hunks[0].briefing is None
+    assert "Recommend OURS" in report.hunks[0].recommendation
 
 
 def test_cli_analyze_clean_repo_fails(scenario):
@@ -128,7 +140,8 @@ def test_cli_analyze_clean_repo_fails(scenario):
     assert "No merge or cherry-pick conflict detected" in res.output
 
 
-def test_cli_analyze_human_readable_output(scenario):
+def test_cli_analyze_human_readable_output(scenario, monkeypatch):
+    monkeypatch.setenv("TRUSTMERGE_LLM", "fake")
     start_conflict(scenario)
     res = runner.invoke(app, ["analyze", "--repo", str(scenario.repo)])
     assert res.exit_code == 0
@@ -136,10 +149,20 @@ def test_cli_analyze_human_readable_output(scenario):
     assert "settings.py" in res.output
     assert "UAT" in res.output
     assert "UNVERIFIED" in res.output
-    assert "Recommend OURS" in res.output
+    assert "AI Conflict Briefing" in res.output
 
 
-def test_cli_analyze_json_output(scenario):
+def test_cli_analyze_no_llm_flag(scenario):
+    start_conflict(scenario)
+    res = runner.invoke(app, ["analyze", "--repo", str(scenario.repo), "--no-llm"])
+    assert res.exit_code == 0
+    assert "TrustMerge Conflict Analysis" in res.output
+    assert "AI Conflict Briefing" not in res.output
+    assert "Recommendation" in res.output
+
+
+def test_cli_analyze_json_output(scenario, monkeypatch):
+    monkeypatch.setenv("TRUSTMERGE_LLM", "fake")
     start_conflict(scenario)
     res = runner.invoke(app, ["analyze", "--repo", str(scenario.repo), "--json"])
     assert res.exit_code == 0
@@ -150,22 +173,31 @@ def test_cli_analyze_json_output(scenario):
     assert hunk["file_path"] == "settings.py"
     assert hunk["ours"]["best_level"] == "UAT"
     assert hunk["theirs"]["best_level"] == "UNVERIFIED"
-    assert "Recommend OURS" in hunk["recommendation"]
+    assert hunk["briefing"] is not None
 
 
 def test_render_report_to_console():
     console = Console(record=True, color_system=None)
     c1 = CommitAnalysis("1"*40, "11111111", "Commit 1", "UAT", "inferred", "reachable from uat", ("uat",), ())
     c2 = CommitAnalysis("2"*40, "22222222", "Commit 2", "UNVERIFIED", "inferred", "only on dev", ("dev",), ())
+    briefing = ConflictBriefing(
+        summary="Test summary",
+        ours_assessment="Ours tested",
+        theirs_assessment="Theirs untested",
+        recommendation="Keep ours",
+        reasoning="Test reasoning",
+    )
     hunk = HunkAnalysis(
         file_path="app.py",
         ours=SideAnalysis("HEAD", ("print('ours')",), (c1,), "UAT"),
         theirs=SideAnalysis("incoming", ("print('theirs')",), (c2,), "UNVERIFIED"),
-        recommendation="Recommend OURS.",
+        recommendation="Keep ours",
+        briefing=briefing,
     )
     rep = ConflictReport("merge", "1"*40, "2"*40, (hunk,))
     render_report(rep, console=console)
     output = console.export_text()
     assert "TrustMerge Conflict Analysis" in output
-    assert "app.py" in output
-    assert "Recommend OURS." in output
+    assert "AI Conflict Briefing" in output
+    assert "Test summary" in output
+    assert "Keep ours" in output
