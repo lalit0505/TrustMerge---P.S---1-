@@ -1,0 +1,6 @@
+model: ollama_chat/qwen2.5-coder:7b
+auto-commits: false
+edit-format: whole
+test-cmd: pytest -q
+auto-test: true
+analytics-disable: true
