@@ -1,0 +1,46 @@
+
+╭──────────────────── TrustMerge Conflict Analysis (MERGE) ────────────────────╮
+│ Conflict between OURS (34a438a6) and THEIRS (330c642a)                       │
+│ Conflicted hunks: 1                                                          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+                           File: settings.py (Hunk 1)                           
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ OURS: HEAD                            ┃ THEIRS: dev                          ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ Level: UAT                            │ Level: UNVERIFIED                    │
+│                                       │                                      │
+│ Code:                                 │ Code:                                │
+│   TIMEOUT = 60                        │   TIMEOUT = 45                       │
+│                                       │                                      │
+│ Origin Commits:                       │ Origin Commits:                      │
+│   • 34a438a6 Fix slow upstream        │   • 330c642a Tune timeout (PR #845)  │
+│ timeout (hotfix #812)                 │     inferred: only on dev; no        │
+│     inferred: reachable from uat      │ evidence it was tested               │
+│     reached: uat                      │     reached: dev                     │
+│     note: same logical change as      │                                      │
+│ 663880a4 on prod (code may differ,    │                                      │
+│ verify separately)                    │                                      │
+└───────────────────────────────────────┴──────────────────────────────────────┘
+╭────────────────────────── 🤖 AI Conflict Briefing ───────────────────────────╮
+│ Summary:                                                                     │
+│ There is a conflict in the `settings.py` file regarding the `TIMEOUT`        │
+│ variable. The current code in the `HEAD` (OURS) has a `TIMEOUT` of 60, which │
+│ is based on UAT testing. The code in the `dev` branch (THEIRS) has a         │
+│ `TIMEOUT` of 45, which has no evidence of testing.                           │
+│                                                                              │
+│ Ours (HEAD):                                                                 │
+│ The `TIMEOUT` of 60 is based on UAT testing, making it verified.             │
+│                                                                              │
+│ Theirs (dev):                                                                │
+│ The `TIMEOUT` of 45 is unverified as there is no evidence it was tested.     │
+│                                                                              │
+│ Recommendation:                                                              │
+│ Merge the `HEAD` version of `settings.py` with a `TIMEOUT` of 60, as it is   │
+│ verified through UAT testing.                                                │
+│                                                                              │
+│ Reasoning:                                                                   │
+│ The `HEAD` version has evidence of being tested in UAT, while the `dev`      │
+│ version lacks any evidence of testing. Therefore, the `HEAD` version should  │
+│ be preferred.                                                                │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
