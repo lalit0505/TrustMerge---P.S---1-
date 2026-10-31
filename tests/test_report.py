@@ -199,7 +199,7 @@ def test_cli_analyze_human_readable_output(scenario, monkeypatch):
     assert "settings.py" in res.output
     assert "UAT" in res.output
     assert "UNVERIFIED" in res.output
-    assert "AI Conflict Briefing" in res.output
+    assert "Rule-based briefing (fake LLM)" in res.output
 
 
 def test_cli_analyze_no_llm_flag(scenario):
@@ -207,7 +207,7 @@ def test_cli_analyze_no_llm_flag(scenario):
     res = runner.invoke(app, ["analyze", "--repo", str(scenario.repo), "--no-llm"])
     assert res.exit_code == 0
     assert "TrustMerge Conflict Analysis" in res.output
-    assert "AI Conflict Briefing" not in res.output
+    assert "Rule-based briefing (fake LLM)" not in res.output
     assert "Recommendation" in res.output
 
 
@@ -224,6 +224,8 @@ def test_cli_analyze_json_output(scenario, monkeypatch):
     assert hunk["ours"]["best_level"] == "UAT"
     assert hunk["theirs"]["best_level"] == "UNVERIFIED"
     assert hunk["briefing"] is not None
+    assert "source" in hunk["briefing"]
+    assert "model" in hunk["briefing"]
 
 
 def test_render_report_to_console():
@@ -236,6 +238,8 @@ def test_render_report_to_console():
         theirs_assessment="Theirs untested",
         recommendation="Keep ours",
         reasoning="Test reasoning",
+        source="llm",
+        model="qwen2.5-coder:7b",
     )
     hunk = HunkAnalysis(
         file_path="app.py",
@@ -251,3 +255,72 @@ def test_render_report_to_console():
     assert "AI Conflict Briefing" in output
     assert "Test summary" in output
     assert "Keep ours" in output
+
+
+def test_regression_d2_validate_briefing_rejects_false_claims_and_contradictions():
+    from trustmerge.report import validate_briefing
+    c_uat = CommitAnalysis("1"*40, "11111111", "c1", "UAT", "recorded", "recorded", (), ())
+    c_unv = CommitAnalysis("2"*40, "22222222", "c2", "UNVERIFIED", "inferred", "inferred", (), ())
+
+    ours = SideAnalysis("HEAD", ("a",), (c_uat,), weakest_level="UAT")
+    theirs = SideAnalysis("incoming", ("b",), (c_unv,), weakest_level="UNVERIFIED")
+    rule_rec = "Recommend OURS: UAT evidence vs UNVERIFIED on THEIRS."
+
+    # 1. Briefing that falsely claims theirs is tested
+    bad_briefing_1 = ConflictBriefing(
+        summary="Summary",
+        ours_assessment="Ours is UAT",
+        theirs_assessment="Theirs is tested and verified on staging",
+        recommendation="Recommend ours",
+        reasoning="Reasoning",
+        source="llm",
+        model="test",
+    )
+    validated_1 = validate_briefing(bad_briefing_1, ours, theirs, rule_rec)
+    assert validated_1.source == "rules (LLM output rejected)"
+    assert validated_1.recommendation == rule_rec
+
+    # 2. Briefing that contradicts rules (recommends theirs over UAT ours)
+    bad_briefing_2 = ConflictBriefing(
+        summary="Summary",
+        ours_assessment="Ours",
+        theirs_assessment="Theirs",
+        recommendation="Prefer theirs changes",
+        reasoning="Reasoning",
+        source="llm",
+        model="test",
+    )
+    validated_2 = validate_briefing(bad_briefing_2, ours, theirs, rule_rec)
+    assert validated_2.source == "rules (LLM output rejected)"
+    assert validated_2.recommendation == rule_rec
+
+
+def test_regression_d2_ollama_failure_caught_and_displays_unavailable():
+    class FailingLLM:
+        def generate_briefing(self, **kwargs):
+            raise ConnectionError("Ollama daemon down")
+
+    console = Console(record=True, color_system=None)
+    c1 = CommitAnalysis("1"*40, "11111111", "Commit 1", "UAT", "inferred", "reachable from uat", ("uat",), ())
+    c2 = CommitAnalysis("2"*40, "22222222", "Commit 2", "UNVERIFIED", "inferred", "only on dev", ("dev",), ())
+    briefing = ConflictBriefing(
+        summary="Conflict summary",
+        ours_assessment="Ours UAT",
+        theirs_assessment="Theirs UNVERIFIED",
+        recommendation="Recommend OURS",
+        reasoning="Reasoning",
+        source="rules",
+        model="LLM unavailable: ConnectionError",
+    )
+    hunk = HunkAnalysis(
+        file_path="app.py",
+        ours=SideAnalysis("HEAD", ("print('ours')",), (c1,), "UAT"),
+        theirs=SideAnalysis("incoming", ("print('theirs')",), (c2,), "UNVERIFIED"),
+        recommendation="Recommend OURS",
+        briefing=briefing,
+    )
+    rep = ConflictReport("merge", "1"*40, "2"*40, (hunk,))
+    render_report(rep, console=console)
+    output = console.export_text()
+    assert "Rule-based briefing (LLM unavailable:" in output
+

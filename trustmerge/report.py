@@ -3,6 +3,7 @@
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
+import re
 from typing import Optional, Tuple
 
 from rich.console import Console
@@ -167,6 +168,95 @@ def generate_recommendation(ours: SideAnalysis, theirs: SideAnalysis) -> str:
         )
 
 
+def _has_positive_tested_claim(text: str) -> bool:
+    """Return True if text asserts that code was tested/verified, rather than stating it was NOT tested."""
+    neg_pattern = re.compile(
+        r"\b(?:no\s+evidence\s+(?:that\s+)?(?:it\s+)?was|not|never(?:\s+claim(?:\s+\w+)*)?|without(?:\s+\w+)?)\s+(?:tested|verified|recorded|passed)\b",
+        re.IGNORECASE,
+    )
+    cleaned = neg_pattern.sub("", text)
+    pos_pattern = re.compile(
+        r"\b(tested|verified|recorded|passed|production-ready)\b", re.IGNORECASE
+    )
+    return bool(pos_pattern.search(cleaned))
+
+
+def validate_briefing(
+    briefing: Optional[ConflictBriefing],
+    ours: SideAnalysis,
+    theirs: SideAnalysis,
+    rule_rec: str,
+) -> Optional[ConflictBriefing]:
+    """Validate LLM briefing against deterministic evidence and recommendations.
+
+    Rejects briefing if:
+    1. It claims unverified/inferred sides are tested/verified/passed.
+    2. It contradicts the deterministic rule-based recommendation.
+    """
+    if briefing is None:
+        return None
+
+    reject_reason = None
+    r_ours = rank(ours.weakest_level)
+    r_theirs = rank(theirs.weakest_level)
+    rec_lower = briefing.recommendation.lower()
+
+    # Contradiction check: recommends the side with weaker evidence
+    if r_ours < r_theirs:
+        if "theirs" in rec_lower and any(
+            w in rec_lower
+            for w in (
+                "recommend theirs",
+                "prefer theirs",
+                "choose theirs",
+                "accept theirs",
+                "take theirs",
+            )
+        ):
+            reject_reason = "recommends side with weaker evidence"
+    elif r_theirs < r_ours:
+        if "ours" in rec_lower and any(
+            w in rec_lower
+            for w in (
+                "recommend ours",
+                "prefer ours",
+                "choose ours",
+                "accept ours",
+                "take ours",
+            )
+        ):
+            reject_reason = "recommends side with weaker evidence"
+
+    # False claim check
+    ours_unverified = (ours.weakest_level in (UNVERIFIED, UNKNOWN)) or any(
+        c.source == "inferred" for c in ours.commits
+    )
+    theirs_unverified = (theirs.weakest_level in (UNVERIFIED, UNKNOWN)) or any(
+        c.source == "inferred" for c in theirs.commits
+    )
+
+    if ours_unverified:
+        if _has_positive_tested_claim(briefing.ours_assessment):
+            reject_reason = "claims unverified ours is tested"
+
+    if theirs_unverified:
+        if _has_positive_tested_claim(briefing.theirs_assessment):
+            reject_reason = "claims unverified theirs is tested"
+
+    if reject_reason:
+        return ConflictBriefing(
+            summary=briefing.summary,
+            ours_assessment=briefing.ours_assessment,
+            theirs_assessment=briefing.theirs_assessment,
+            recommendation=rule_rec,
+            reasoning=f"LLM output rejected ({reject_reason}). {rule_rec}",
+            source="rules (LLM output rejected)",
+            model=briefing.model,
+        )
+
+    return briefing
+
+
 def build_conflict_report(
     repo: Path,
     config: Config = Config(),
@@ -211,7 +301,7 @@ def build_conflict_report(
             if llm is not None:
                 try:
                     related_all = [rel for c in (ours_commits + theirs_commits) for rel in c.related]
-                    briefing = llm.generate_briefing(
+                    raw_briefing = llm.generate_briefing(
                         file_path=hunk.file_path,
                         ours_label=ours_side.label,
                         ours_code="\n".join(ours_side.lines),
@@ -225,18 +315,28 @@ def build_conflict_report(
                         theirs_reached=list({r for c in theirs_side.commits for r in c.reached}),
                         related_notes=related_all,
                     )
-                except Exception:
-                    briefing = None
+                    briefing = validate_briefing(raw_briefing, ours_side, theirs_side, rule_rec)
+                except Exception as exc:
+                    short_reason = str(exc)
+                    if len(short_reason) > 50:
+                        short_reason = short_reason[:47] + "..."
+                    briefing = ConflictBriefing(
+                        summary=f"Conflict in {hunk.file_path}: {ours_side.label} vs {theirs_side.label}.",
+                        ours_assessment=f"{ours_side.label} ({ours_side.weakest_level}).",
+                        theirs_assessment=f"{theirs_side.label} ({theirs_side.weakest_level}).",
+                        recommendation=rule_rec,
+                        reasoning=f"Rule-based reasoning: {rule_rec}",
+                        source="rules",
+                        model=short_reason or "unavailable",
+                    )
 
-
-            final_rec = briefing.recommendation if briefing is not None else rule_rec
-
+            # The deterministic rule-based recommendation is ALWAYS the recommendation field
             hunk_analyses.append(
                 HunkAnalysis(
                     file_path=hunk.file_path,
                     ours=ours_side,
                     theirs=theirs_side,
-                    recommendation=final_rec,
+                    recommendation=rule_rec,
                     briefing=briefing,
                 )
             )
@@ -354,10 +454,24 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
                 f"[bold]Recommendation:[/]\n{escape(hunk.briefing.recommendation)}\n\n"
                 f"[bold]Reasoning:[/]\n{escape(hunk.briefing.reasoning)}"
             )
+            if hunk.briefing.source == "llm":
+                panel_title = f"[bold green]🤖 AI Conflict Briefing ({escape(hunk.briefing.model or 'llm')})[/]"
+                border_color = "green"
+            elif hunk.briefing.model == "fake" or hunk.briefing.source == "fake":
+                panel_title = "[bold green]🤖 Rule-based briefing (fake LLM)[/]"
+                border_color = "green"
+            elif hunk.briefing.source == "rules (LLM output rejected)":
+                panel_title = "[bold yellow]Rule-based briefing (LLM output rejected)[/]"
+                border_color = "yellow"
+            else:
+                reason = hunk.briefing.model or "unavailable"
+                panel_title = f"[bold yellow]Rule-based briefing ({escape(reason)})[/]"
+                border_color = "yellow"
+
             briefing_panel = Panel(
                 briefing_text,
-                title="[bold green]🤖 AI Conflict Briefing[/]",
-                border_style="green",
+                title=panel_title,
+                border_style=border_color,
             )
             console.print(briefing_panel)
         else:
