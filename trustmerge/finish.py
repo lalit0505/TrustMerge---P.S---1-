@@ -1,22 +1,111 @@
 """``git prov finish`` — finalize conflict resolution with standard trailers and a note."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import typer
 
 from trustmerge.conflicts import get_theirs_head, is_conflicted, list_conflicted_paths
 from trustmerge.git import GitError, rev_parse, run_git
-from trustmerge.levels import CI_PASSED, PROD, RECORDABLE, UAT
+from trustmerge.levels import CI_PASSED, PROD, RECORDABLE, UAT, rank
 from trustmerge.notes import NoteRecord, write_note
+from trustmerge.provenance import assess
+
+
+def _get_kept_commits(
+    repo: Path,
+    ours_head: str,
+    theirs_head: Optional[str],
+    staged_files: list[str],
+) -> list[str]:
+    """Find the commits belonging to the sides that were kept in the staged resolution."""
+    if not theirs_head:
+        return [ours_head]
+
+    base = run_git(repo, "merge-base", ours_head, theirs_head, check=False).strip()
+
+    diff_ours = run_git(repo, "diff", "--cached", ours_head, check=False).strip()
+    diff_theirs = run_git(repo, "diff", "--cached", theirs_head, check=False).strip()
+
+    if not diff_ours and diff_theirs:
+        # Kept ours exactly
+        if base:
+            c = run_git(repo, "rev-list", f"{base}..{ours_head}", check=False).splitlines()
+            return [x.strip() for x in c if x.strip()] or [ours_head]
+        return [ours_head]
+
+    if not diff_theirs and diff_ours:
+        # Kept theirs exactly
+        if base:
+            c = run_git(repo, "rev-list", f"{base}..{theirs_head}", check=False).splitlines()
+            return [x.strip() for x in c if x.strip()] or [theirs_head]
+        return [theirs_head]
+
+    ours_kept = False
+    theirs_kept = False
+
+    if base:
+        staged_lines = set()
+        for f in staged_files:
+            try:
+                content = run_git(repo, "show", f":0:{f}", check=False)
+                for line in content.splitlines():
+                    s = line.strip()
+                    if s:
+                        staged_lines.add(s)
+            except Exception:
+                pass
+
+        diff_theirs_added = [
+            line[1:].strip()
+            for line in run_git(repo, "diff", base, theirs_head, check=False).splitlines()
+            if line.startswith("+") and not line.startswith("+++") and line[1:].strip()
+        ]
+        diff_ours_added = [
+            line[1:].strip()
+            for line in run_git(repo, "diff", base, ours_head, check=False).splitlines()
+            if line.startswith("+") and not line.startswith("+++") and line[1:].strip()
+        ]
+
+        for line in diff_theirs_added:
+            if line in staged_lines:
+                theirs_kept = True
+                break
+
+        for line in diff_ours_added:
+            if line in staged_lines:
+                ours_kept = True
+                break
+
+    if not ours_kept and not theirs_kept:
+        ours_kept = True
+        theirs_kept = True
+
+    kept_commits: list[str] = []
+    if ours_kept:
+        if base:
+            c = run_git(repo, "rev-list", f"{base}..{ours_head}", check=False).splitlines()
+            kept_commits.extend([x.strip() for x in c if x.strip()] or [ours_head])
+        else:
+            kept_commits.append(ours_head)
+    if theirs_kept:
+        if base:
+            c = run_git(repo, "rev-list", f"{base}..{theirs_head}", check=False).splitlines()
+            kept_commits.extend([x.strip() for x in c if x.strip()] or [theirs_head])
+        else:
+            kept_commits.append(theirs_head)
+
+    return kept_commits or [ours_head]
 
 
 def finish_conflict(
     repo: Path,
     message: Optional[str] = None,
-    tested_in: str = "uat",
+    tested_in: Optional[str] = None,
+    evidence: Optional[str] = None,
     provenance: Optional[str] = None,
     add_all: bool = False,
+    force_claim: bool = False,
 ) -> str:
     """Create a standard Git commit with Provenance and Tested-in trailers and a note.
 
@@ -57,6 +146,37 @@ def finish_conflict(
     if not staged_files and not is_merging:
         raise GitError("No staged changes to commit.", stderr="")
 
+    ours_head = run_git(repo, "rev-parse", "HEAD", check=False)
+
+    norm_level: Optional[str] = None
+    if tested_in is not None:
+        if not evidence or not evidence.strip():
+            raise GitError(
+                "--evidence is required when --tested-in is specified.",
+                stderr="",
+            )
+        candidate_level = tested_in.strip().upper().replace("_", "-")
+        if candidate_level not in RECORDABLE:
+            raise GitError(
+                f"Invalid level '{tested_in}'. Allowed levels: {', '.join(sorted(RECORDABLE))}.",
+                stderr="",
+            )
+        norm_level = candidate_level
+
+        # Cap the claim
+        kept_commits = _get_kept_commits(repo, ours_head, theirs_head, staged_files)
+        weakest_commit = max(kept_commits, key=lambda c: rank(assess(repo, c).level))
+        weakest_level = assess(repo, weakest_commit).level
+
+        if rank(norm_level) < rank(weakest_level):
+            if not force_claim:
+                raise GitError(
+                    f"Claimed level '{norm_level}' is stronger than the weakest level among "
+                    f"commits of the kept sides ('{weakest_level}' on {weakest_commit[:8]}). "
+                    "Use --force-claim to override.",
+                    stderr="",
+                )
+
     # Determine commit subject
     if message and message.strip():
         base_msg = message.strip()
@@ -73,7 +193,6 @@ def finish_conflict(
             base_msg = "Resolve conflict"
 
     # Determine trailers
-    ours_head = run_git(repo, "rev-parse", "HEAD", check=False)
     if not provenance:
         if theirs_head and ours_head:
             provenance = f"{ours_head[:8]} (ours), {theirs_head[:8]} (theirs)"
@@ -82,29 +201,20 @@ def finish_conflict(
         else:
             provenance = "manual resolution"
 
-    tested_trailer = tested_in.lower().strip()
-    trailers = [
-        f"Provenance: {provenance}",
-        f"Tested-in: {tested_trailer}",
-    ]
+    trailers = [f"Provenance: {provenance}"]
+    if norm_level is not None:
+        trailers.append(f"Tested-in: {norm_level.lower()}")
+
     full_message = f"{base_msg}\n\n" + "\n".join(trailers) + "\n"
 
     # Create the Git commit
     run_git(repo, "commit", "-m", full_message)
     new_sha = run_git(repo, "rev-parse", "HEAD")
 
-    # Record provenance note on the new commit
-    norm_level = tested_trailer.upper().replace("_", "-")
-    if norm_level not in RECORDABLE:
-        if "prod" in tested_trailer:
-            norm_level = PROD
-        elif "uat" in tested_trailer:
-            norm_level = UAT
-        else:
-            norm_level = CI_PASSED
-
-    record = NoteRecord(level=norm_level, evidence=f"provenance: {provenance}")
-    write_note(repo, new_sha, record)
+    # Record provenance note on the new commit if tested_in was provided
+    if norm_level is not None and evidence is not None:
+        record = NoteRecord(level=norm_level, evidence=evidence.strip())
+        write_note(repo, new_sha, record)
 
     return new_sha
 
@@ -117,8 +227,16 @@ def register(app: typer.Typer) -> None:
         message: Optional[str] = typer.Option(
             None, "--message", "-m", help="Commit message (defaults to merge message)"
         ),
-        tested_in: str = typer.Option(
-            "uat", "--tested-in", "-t", help="Tested environment trailer (e.g. uat, prod)"
+        tested_in: Optional[str] = typer.Option(
+            None, "--tested-in", "-t", help="Tested environment trailer (e.g. uat, prod)"
+        ),
+        evidence: Optional[str] = typer.Option(
+            None, "--evidence", "-e", help="Evidence text supporting the tested-in claim"
+        ),
+        force_claim: bool = typer.Option(
+            False,
+            "--force-claim",
+            help="Allow claiming an evidence level stronger than the commits of the kept sides",
         ),
         provenance: Optional[str] = typer.Option(
             None, "--provenance", "-p", help="Provenance description/trailer content"
@@ -134,10 +252,13 @@ def register(app: typer.Typer) -> None:
                 repo=repo,
                 message=message,
                 tested_in=tested_in,
+                evidence=evidence,
                 provenance=provenance,
                 add_all=add_all,
+                force_claim=force_claim,
             )
             typer.echo(f"Created resolution commit {new_sha[:8]} with trailers and note.")
         except GitError as exc:
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(1)
+

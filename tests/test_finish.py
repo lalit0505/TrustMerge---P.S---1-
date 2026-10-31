@@ -40,6 +40,7 @@ def test_finish_creates_commit_with_trailers_and_note(scenario):
         repo=repo,
         message="Resolve timeout conflict",
         tested_in="uat",
+        evidence=f"provenance: {scenario.backport[:8]} (uat)",
         provenance=f"{scenario.backport[:8]} (uat)",
     )
 
@@ -93,6 +94,9 @@ def test_cli_finish_success(scenario):
             "Keep UAT timeout",
             "--tested-in",
             "prod",
+            "--evidence",
+            "prod manual run verified",
+            "--force-claim",
             "--repo",
             str(repo),
         ],
@@ -121,3 +125,85 @@ def test_cli_finish_with_all_flag(scenario):
     res = runner.invoke(app, ["finish", "--all", "--repo", str(repo)])
     assert res.exit_code == 0
     assert "Created resolution commit" in res.output
+
+
+def test_regression_a1_finish_without_tested_in_emits_no_note_and_no_tested_trailer(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+    (repo / "settings.py").write_text(
+        "DEBUG = False\nTIMEOUT = 60\nRETRIES = 3\nALLOWED_HOSTS = [\"example.com\"]\n"
+    )
+    git(repo, "add", "settings.py")
+    new_sha = finish_conflict(repo=repo, message="Resolve conflict cleanly")
+    log_msg = git(repo, "log", "-1", "--format=%B").stdout
+    assert "Provenance:" in log_msg
+    assert "Tested-in:" not in log_msg
+    assert read_note(repo, new_sha) is None
+
+
+def test_regression_a1_invalid_level_rejected(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+    (repo / "settings.py").write_text(
+        "DEBUG = False\nTIMEOUT = 60\nRETRIES = 3\nALLOWED_HOSTS = [\"example.com\"]\n"
+    )
+    git(repo, "add", "settings.py")
+    with pytest.raises(GitError, match="Invalid level 'staging'"):
+        finish_conflict(repo=repo, tested_in="staging", evidence="some run")
+
+
+def test_regression_a1_requires_evidence_with_tested_in(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+    (repo / "settings.py").write_text(
+        "DEBUG = False\nTIMEOUT = 60\nRETRIES = 3\nALLOWED_HOSTS = [\"example.com\"]\n"
+    )
+    git(repo, "add", "settings.py")
+    with pytest.raises(GitError, match="--evidence is required"):
+        finish_conflict(repo=repo, tested_in="uat", evidence=None)
+
+
+def test_regression_a1_note_stores_evidence_text(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+    (repo / "settings.py").write_text(
+        "DEBUG = False\nTIMEOUT = 60\nRETRIES = 3\nALLOWED_HOSTS = [\"example.com\"]\n"
+    )
+    git(repo, "add", "settings.py")
+    new_sha = finish_conflict(
+        repo=repo,
+        tested_in="uat",
+        evidence="https://ci.example.com/job/42",
+        provenance=f"{scenario.backport[:8]} (uat)",
+    )
+    notes = read_note(repo, new_sha)
+    assert notes is not None
+    assert notes[0].evidence == "https://ci.example.com/job/42"
+
+
+def test_regression_a1_claim_capping_and_force_claim(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+    # Resolve by taking DEV side (untested)
+    (repo / "settings.py").write_text(
+        "DEBUG = False\nTIMEOUT = 45\nRETRIES = 3\nALLOWED_HOSTS = [\"example.com\"]\n"
+    )
+    git(repo, "add", "settings.py")
+    # Claiming UAT without force-claim must fail because dev commit is UNVERIFIED
+    with pytest.raises(GitError, match="stronger than the weakest level"):
+        finish_conflict(
+            repo=repo,
+            tested_in="uat",
+            evidence="claimed UAT",
+            force_claim=False,
+        )
+    # With force_claim=True it succeeds
+    new_sha = finish_conflict(
+        repo=repo,
+        tested_in="uat",
+        evidence="claimed UAT forced",
+        force_claim=True,
+    )
+    notes = read_note(repo, new_sha)
+    assert notes[0].level == "UAT"
+
