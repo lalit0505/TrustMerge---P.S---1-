@@ -24,6 +24,16 @@ class SameChangeVerdict(BaseModel):
     )
 
 
+class ConflictBriefing(BaseModel):
+    """Plain-English briefing explaining the conflict based strictly on collected evidence."""
+
+    summary: str = Field(..., description="High-level plain English summary of the conflict")
+    ours_assessment: str = Field(..., description="Explanation of ours origin and evidence")
+    theirs_assessment: str = Field(..., description="Explanation of theirs origin and evidence")
+    recommendation: str = Field(..., description="Clear recommendation on how to resolve the conflict")
+    reasoning: str = Field(..., description="Detailed rationale based strictly on the provided evidence")
+
+
 class LLMClient(Protocol):
     """Protocol for LLM interactions."""
 
@@ -35,6 +45,24 @@ class LLMClient(Protocol):
         message_b: str = "",
     ) -> SameChangeVerdict:
         """Judge whether two patches represent the same logical change."""
+        ...
+
+    def generate_briefing(
+        self,
+        file_path: str,
+        ours_label: str,
+        ours_code: str,
+        ours_evidence_level: str,
+        ours_evidence_detail: str,
+        ours_reached: list[str],
+        theirs_label: str,
+        theirs_code: str,
+        theirs_evidence_level: str,
+        theirs_evidence_detail: str,
+        theirs_reached: list[str],
+        related_notes: list[str] = [],
+    ) -> ConflictBriefing:
+        """Generate a plain-English briefing of the conflict based strictly on evidence."""
         ...
 
 
@@ -96,20 +124,92 @@ class OllamaClient:
                 raw_text = data.get("response", "{}")
                 return SameChangeVerdict.model_validate_json(raw_text)
         except Exception as exc:
-            # Fallback if Ollama is unreachable or response invalid
             return SameChangeVerdict(
                 same_change=False,
                 confidence=0.0,
                 reasoning=f"LLM evaluation unavailable: {exc}",
             )
 
+    def generate_briefing(
+        self,
+        file_path: str,
+        ours_label: str,
+        ours_code: str,
+        ours_evidence_level: str,
+        ours_evidence_detail: str,
+        ours_reached: list[str],
+        theirs_label: str,
+        theirs_code: str,
+        theirs_evidence_level: str,
+        theirs_evidence_detail: str,
+        theirs_reached: list[str],
+        related_notes: list[str] = [],
+    ) -> ConflictBriefing:
+        notes_str = "\n".join(f"- {n}" for n in related_notes) if related_notes else "none"
+        prompt = (
+            "You are a Git provenance conflict briefing assistant. Explain the conflict in plain English based ONLY on the evidence collected below.\n"
+            "CRITICAL RULE: Never claim something is tested without evidence, and always show where the evidence comes from. "
+            "If the evidence doesn't say it's tested, say it's unverified. Never default to 'safe'.\n\n"
+            f"File: {file_path}\n"
+            f"OURS ({ours_label}):\n"
+            f"- Code:\n{ours_code[:2000]}\n"
+            f"- Evidence level: {ours_evidence_level}\n"
+            f"- Detail: {ours_evidence_detail}\n"
+            f"- Branches reached: {', '.join(ours_reached) or 'none'}\n\n"
+            f"THEIRS ({theirs_label}):\n"
+            f"- Code:\n{theirs_code[:2000]}\n"
+            f"- Evidence level: {theirs_evidence_level}\n"
+            f"- Detail: {theirs_evidence_detail}\n"
+            f"- Branches reached: {', '.join(theirs_reached) or 'none'}\n\n"
+            f"Related Notes:\n{notes_str}\n\n"
+            "Return ONLY a valid JSON object matching this schema:\n"
+            "{\n"
+            '  "summary": "plain English summary",\n'
+            '  "ours_assessment": "assessment of ours code and evidence",\n'
+            '  "theirs_assessment": "assessment of theirs code and evidence",\n'
+            '  "recommendation": "concrete recommendation",\n'
+            '  "reasoning": "rationale based strictly on evidence"\n'
+            "}"
+        )
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            "options": {
+                "temperature": 0.0,
+                "num_ctx": 16384,
+            },
+        }
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(f"{self.base_url}/api/generate", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                raw_text = data.get("response", "{}")
+                return ConflictBriefing.model_validate_json(raw_text)
+        except Exception as exc:
+            return ConflictBriefing(
+                summary=f"Conflict in {file_path} between {ours_label} ({ours_evidence_level}) and {theirs_label} ({theirs_evidence_level}).",
+                ours_assessment=f"Ours ({ours_label}) has {ours_evidence_level} evidence ({ours_evidence_detail}).",
+                theirs_assessment=f"Theirs ({theirs_label}) has {theirs_evidence_level} evidence ({theirs_evidence_detail}).",
+                recommendation=f"Prefer {ours_label} if tested ({ours_evidence_level}), otherwise verify before merging.",
+                reasoning=f"LLM briefing fallback due to: {exc}",
+            )
+
 
 class FakeLLMClient:
     """Deterministic fake client for CI and tests where Ollama is not running."""
 
-    def __init__(self, default_verdict: Optional[SameChangeVerdict] = None):
+    def __init__(
+        self,
+        default_verdict: Optional[SameChangeVerdict] = None,
+        default_briefing: Optional[ConflictBriefing] = None,
+    ):
         self.default_verdict = default_verdict
+        self.default_briefing = default_briefing
         self.calls: list[dict] = []
+        self.briefing_calls: list[dict] = []
 
     def judge_same_change(
         self,
@@ -129,7 +229,6 @@ class FakeLLMClient:
         if self.default_verdict is not None:
             return self.default_verdict
 
-        # Deterministic diff and ticket heuristic
         def extract_added(patch: str) -> list[str]:
             lines = []
             for line in patch.splitlines():
@@ -149,7 +248,6 @@ class FakeLLMClient:
                 reasoning=f"Both patches add identical logical code: {list(shared_code)[:2]}",
             )
 
-        # Check for shared ticket / PR numbers
         tickets_a = set(re.findall(r"(?:#|GH-)\d+", f"{message_a}\n{patch_a}"))
         tickets_b = set(re.findall(r"(?:#|GH-)\d+", f"{message_b}\n{patch_b}"))
         shared_tickets = tickets_a.intersection(tickets_b)
@@ -164,6 +262,46 @@ class FakeLLMClient:
             same_change=False,
             confidence=0.85,
             reasoning="Patches introduce different code changes without shared ticket references",
+        )
+
+    def generate_briefing(
+        self,
+        file_path: str,
+        ours_label: str,
+        ours_code: str,
+        ours_evidence_level: str,
+        ours_evidence_detail: str,
+        ours_reached: list[str],
+        theirs_label: str,
+        theirs_code: str,
+        theirs_evidence_level: str,
+        theirs_evidence_detail: str,
+        theirs_reached: list[str],
+        related_notes: list[str] = [],
+    ) -> ConflictBriefing:
+        self.briefing_calls.append(
+            {
+                "file_path": file_path,
+                "ours_label": ours_label,
+                "theirs_label": theirs_label,
+            }
+        )
+        if self.default_briefing is not None:
+            return self.default_briefing
+
+        return ConflictBriefing(
+            summary=f"Conflict in {file_path}: {ours_label} ({ours_evidence_level}) vs {theirs_label} ({theirs_evidence_level}).",
+            ours_assessment=f"{ours_label} is {ours_evidence_level} ({ours_evidence_detail}), reached: {', '.join(ours_reached) or 'none'}.",
+            theirs_assessment=f"{theirs_label} is {theirs_evidence_level} ({theirs_evidence_detail}), reached: {', '.join(theirs_reached) or 'none'}.",
+            recommendation=(
+                f"Accept {ours_label} over unverified changes."
+                if ours_evidence_level in ("PROD", "UAT", "CI-PASSED") and theirs_evidence_level == "UNVERIFIED"
+                else "Resolve based on verified evidence."
+            ),
+            reasoning=(
+                "Never claim code is tested without recorded evidence. "
+                f"Ours has {ours_evidence_level} evidence while theirs is {theirs_evidence_level}."
+            ),
         )
 
 

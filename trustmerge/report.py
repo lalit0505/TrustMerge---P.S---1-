@@ -8,12 +8,12 @@ from typing import Optional, Tuple
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 import typer
 
 from trustmerge.conflicts import ConflictState, find_conflicts
 from trustmerge.git import rev_parse, run_git
 from trustmerge.levels import CI_PASSED, PROD, UAT, UNKNOWN, UNVERIFIED, rank
+from trustmerge.llm import ConflictBriefing, LLMClient, get_llm_client
 from trustmerge.provenance import Config, assess, short
 
 
@@ -49,6 +49,7 @@ class HunkAnalysis:
     ours: SideAnalysis
     theirs: SideAnalysis
     recommendation: str
+    briefing: Optional[ConflictBriefing] = None
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,6 @@ def best_evidence_level(commits: Tuple[CommitAnalysis, ...]) -> str:
 
 def generate_recommendation(ours: SideAnalysis, theirs: SideAnalysis) -> str:
     """Generate a deterministic rule-based recommendation based on evidence."""
-    # Check if either side references the other as the same logical change
     ours_shas = {c.sha for c in ours.commits}
     theirs_shas = {c.sha for c in theirs.commits}
 
@@ -144,12 +144,17 @@ def generate_recommendation(ours: SideAnalysis, theirs: SideAnalysis) -> str:
 
 
 def build_conflict_report(
-    repo: Path, config: Config = Config()
+    repo: Path,
+    config: Config = Config(),
+    use_llm: bool = True,
+    client: Optional[LLMClient] = None,
 ) -> Optional[ConflictReport]:
     """Inspect conflicted repository and produce a structured analysis report."""
     state = find_conflicts(repo)
     if not state:
         return None
+
+    llm = (client or get_llm_client()) if use_llm else None
 
     hunk_analyses: list[HunkAnalysis] = []
     for file in state.files:
@@ -174,13 +179,38 @@ def build_conflict_report(
                 best_level=best_evidence_level(theirs_commits),
             )
 
-            rec = generate_recommendation(ours_side, theirs_side)
+            rule_rec = generate_recommendation(ours_side, theirs_side)
+            briefing = None
+
+            if llm is not None:
+                try:
+                    related_all = [rel for c in (ours_commits + theirs_commits) for rel in c.related]
+                    briefing = llm.generate_briefing(
+                        file_path=hunk.file_path,
+                        ours_label=ours_side.label,
+                        ours_code="\n".join(ours_side.lines),
+                        ours_evidence_level=ours_side.best_level,
+                        ours_evidence_detail="; ".join(c.detail for c in ours_side.commits) or "none",
+                        ours_reached=list({r for c in ours_side.commits for r in c.reached}),
+                        theirs_label=theirs_side.label,
+                        theirs_code="\n".join(theirs_side.lines),
+                        theirs_evidence_level=theirs_side.best_level,
+                        theirs_evidence_detail="; ".join(c.detail for c in theirs_side.commits) or "none",
+                        theirs_reached=list({r for c in theirs_side.commits for r in c.reached}),
+                        related_notes=related_all,
+                    )
+                except Exception:
+                    briefing = None
+
+            final_rec = briefing.recommendation if briefing is not None else rule_rec
+
             hunk_analyses.append(
                 HunkAnalysis(
                     file_path=hunk.file_path,
                     ours=ours_side,
                     theirs=theirs_side,
-                    recommendation=rec,
+                    recommendation=final_rec,
+                    briefing=briefing,
                 )
             )
 
@@ -197,7 +227,12 @@ def build_conflict_report(
 
 def report_to_dict(report: ConflictReport) -> dict:
     """Convert ConflictReport to a serializable dictionary."""
-    return asdict(report)
+    data = asdict(report)
+    for hunk in data.get("hunks", []):
+        b = hunk.get("briefing")
+        if b is not None and hasattr(b, "model_dump"):
+            hunk["briefing"] = b.model_dump()
+    return data
 
 
 _LEVEL_COLORS = {
@@ -268,12 +303,27 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
         )
         console.print(table)
 
-        rec_panel = Panel(
-            hunk.recommendation,
-            title="[bold yellow]💡 Recommendation[/]",
-            border_style="yellow",
-        )
-        console.print(rec_panel)
+        if hunk.briefing:
+            briefing_text = (
+                f"[bold]Summary:[/]\n{hunk.briefing.summary}\n\n"
+                f"[bold]Ours ({hunk.ours.label}):[/]\n{hunk.briefing.ours_assessment}\n\n"
+                f"[bold]Theirs ({hunk.theirs.label}):[/]\n{hunk.briefing.theirs_assessment}\n\n"
+                f"[bold]Recommendation:[/]\n{hunk.briefing.recommendation}\n\n"
+                f"[bold]Reasoning:[/]\n{hunk.briefing.reasoning}"
+            )
+            briefing_panel = Panel(
+                briefing_text,
+                title="[bold green]🤖 AI Conflict Briefing[/]",
+                border_style="green",
+            )
+            console.print(briefing_panel)
+        else:
+            rec_panel = Panel(
+                hunk.recommendation,
+                title="[bold yellow]💡 Recommendation[/]",
+                border_style="yellow",
+            )
+            console.print(rec_panel)
         console.print()
 
 
@@ -287,9 +337,12 @@ def register(app: typer.Typer) -> None:
     def analyze(
         repo: Path = typer.Option(Path("."), "--repo", help="Path to git repository"),
         as_json: bool = typer.Option(False, "--json", help="Output analysis as JSON"),
+        use_llm: bool = typer.Option(
+            True, "--llm/--no-llm", help="Generate AI conflict briefing with Ollama"
+        ),
     ) -> None:
         """Analyze conflict: origin commits, testing evidence, and recommendation."""
-        report = build_conflict_report(repo)
+        report = build_conflict_report(repo, use_llm=use_llm)
         if not report:
             typer.echo("No merge or cherry-pick conflict detected.", err=True)
             raise typer.Exit(1)
