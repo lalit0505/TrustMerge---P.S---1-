@@ -10,3 +10,6 @@ dist/
 .aider*
 !.aider.conf.yml
 !.aider.model.settings.yml
+.coverage
+.coverage.*
+htmlcov/

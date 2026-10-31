@@ -188,3 +188,95 @@ def test_regression_d3_model_defaults_and_timeout():
     assert "</data>" not in defend_data(malicious)[6:-7]
 
 
+def test_ollama_client_mock_methods(monkeypatch):
+    import httpx
+    from trustmerge.llm import OllamaClient, ConflictBriefing, ExtractedReferences, SameChangeVerdict
+
+    client = OllamaClient()
+
+    # 1. generate_briefing success
+    briefing_payload = {
+        "summary": "Mock summary",
+        "ours_assessment": "Mock ours",
+        "theirs_assessment": "Mock theirs",
+        "recommendation": "Mock rec",
+        "reasoning": "Mock reason",
+    }
+    class MockSuccessClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, json=None):
+            req = httpx.Request("POST", url)
+            return httpx.Response(200, json={"response": json_mod.dumps(briefing_payload)}, request=req)
+
+    import json as json_mod
+    monkeypatch.setattr("httpx.Client", MockSuccessClient)
+    res = client.generate_briefing("file.py", "ours", "code1", "PROD", "det1", ["prod"], "theirs", "code2", "DEV", "det2", ["dev"])
+    assert res.summary == "Mock summary"
+    assert res.source == "llm"
+    assert res.model == client.model
+
+    # 2. extract_references_from_message success
+    ref_payload = {"commit_hashes": ["abc1234"], "pr_numbers": ["GH-10"]}
+    class MockRefClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, json=None):
+            req = httpx.Request("POST", url)
+            return httpx.Response(200, json={"response": json_mod.dumps(ref_payload)}, request=req)
+
+    monkeypatch.setattr("httpx.Client", MockRefClient)
+    extracted = client.extract_references_from_message("cherry-picked from abc1234 GH-10")
+    assert extracted.commit_hashes == ["abc1234"]
+    assert extracted.pr_numbers == ["GH-10"]
+
+    # 3. Timeouts
+    class MockTimeoutClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, json=None):
+            raise httpx.TimeoutException("Timeout")
+
+    monkeypatch.setattr("httpx.Client", MockTimeoutClient)
+    with pytest.raises(TimeoutError, match="Ollama request timed out"):
+        client.generate_briefing("file.py", "ours", "c1", "PROD", "d1", [], "theirs", "c2", "DEV", "d2", [])
+
+    with pytest.raises(TimeoutError, match="Ollama request timed out"):
+        client.judge_same_change("patch a", "patch b", "msg a", "msg b")
+
+    with pytest.raises(TimeoutError, match="Ollama request timed out"):
+        client.extract_references_from_message("msg")
+
+    # 4. Generic errors
+    class MockErrorClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, json=None):
+            raise RuntimeError("Connection dropped")
+
+    monkeypatch.setattr("httpx.Client", MockErrorClient)
+    with pytest.raises(RuntimeError, match="Ollama judge failed"):
+        client.judge_same_change("patch a", "patch b", "msg a", "msg b")
+
+    # extract_references catches generic exception and returns empty
+    empty_refs = client.extract_references_from_message("msg")
+    assert empty_refs.commit_hashes == []
+
+
+

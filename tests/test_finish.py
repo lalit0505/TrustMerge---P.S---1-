@@ -247,3 +247,85 @@ def test_regression_b7_all_flag_prints_staged_files(scenario):
     assert "Staged" in res.output or "staged" in res.output
 
 
+def test_finish_trailer_merge_edge_cases():
+    from trustmerge.finish import _merge_trailers, _sanitize_trailer_value
+    assert _sanitize_trailer_value(None) is None
+
+    # Only trailers, no body
+    merged = _merge_trailers("", [("Provenance", "abc")])
+    assert merged.strip() == "Provenance: abc"
+
+    # Existing trailers updated and duplicates removed
+    msg = (
+        "Subject\n\n"
+        "Tested-in: dev\n"
+        "Tested-in: uat\n"
+        "Signed-off-by: dev@example.com"
+    )
+    res = _merge_trailers(msg, [("Tested-in", "prod"), ("Provenance", "xyz")])
+    assert res.count("Tested-in:") == 1
+    assert "Tested-in: prod" in res
+    assert "Provenance: xyz" in res
+    assert "Signed-off-by: dev@example.com" in res
+
+
+def test_finish_marker_sequence_staged_error(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+
+    # Stage a file with real unresolved marker sequence
+    bad_content = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> dev\n"
+    (repo / "settings.py").write_text(bad_content)
+    git(repo, "add", "settings.py")
+
+    with pytest.raises(GitError, match="Unresolved conflict markers remain inside settings.py"):
+        finish_conflict(repo=repo)
+
+
+def test_finish_kept_commits_edge_cases(scenario):
+    from trustmerge.finish import _get_kept_commits
+    repo = scenario.repo
+
+    # theirs_head is None
+    res = _get_kept_commits(repo, scenario.dev_change, None, [])
+    assert res == [scenario.dev_change]
+
+    # Staged resolution keeping ours exactly
+    start_conflict(scenario)
+    git(repo, "checkout", "--ours", "settings.py")
+    git(repo, "add", "settings.py")
+    res_ours = _get_kept_commits(repo, scenario.backport, scenario.dev_change, ["settings.py"])
+    assert scenario.backport in res_ours
+
+    # Staged resolution keeping theirs exactly
+    git(repo, "checkout", scenario.dev_change, "--", "settings.py")
+    git(repo, "add", "settings.py")
+    res_theirs = _get_kept_commits(repo, scenario.backport, scenario.dev_change, ["settings.py"])
+    assert scenario.dev_change in res_theirs
+
+    # Custom rewrite
+    (repo / "settings.py").write_text("DEBUG = True\nCUSTOM = 1\n")
+    git(repo, "add", "settings.py")
+    res_custom = _get_kept_commits(repo, scenario.backport, scenario.dev_change, ["settings.py"])
+    assert len(res_custom) >= 1
+
+
+def test_finish_message_and_provenance_defaults(scenario):
+    start_conflict(scenario)
+    repo = scenario.repo
+
+    (repo / "settings.py").write_text("DEBUG = False\nTIMEOUT = 60\n")
+    git(repo, "add", "settings.py")
+
+    # Remove MERGE_MSG to exercise fallback
+    merge_msg = repo / ".git" / "MERGE_MSG"
+    if merge_msg.exists():
+        merge_msg.unlink()
+
+    new_sha = finish_conflict(repo=repo)
+    log_msg = git(repo, "log", "-1", "--format=%B").stdout
+    assert "Resolve conflict with" in log_msg
+    assert "Provenance:" in log_msg
+
+
+
