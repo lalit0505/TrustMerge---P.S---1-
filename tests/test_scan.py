@@ -59,3 +59,11 @@ def test_cli_scan_json(scenario):
 def test_cli_scan_bad_repo(tmp_path):
     result = runner.invoke(app, ["dev", "--repo", str(tmp_path)])
     assert result.exit_code == 1
+
+
+def test_regression_d1_scan_verbose_llm_flag(scenario, monkeypatch):
+    monkeypatch.setenv("TRUSTMERGE_LLM", "fake")
+    result = runner.invoke(app, ["dev", "--repo", str(scenario.repo), "--verbose", "--llm"])
+    assert result.exit_code == 0
+    assert "LLM used: judge x" in result.output
+

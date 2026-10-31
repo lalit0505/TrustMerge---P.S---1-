@@ -109,3 +109,63 @@ def test_ollama_client_real_if_available():
     assert verdict.same_change is True
     assert verdict.confidence > 0.5
     assert len(verdict.reasoning) > 0
+
+
+def test_regression_d1_llm_judge_does_not_raise_level_and_adds_note(scenario):
+    from trustmerge.provenance import infer_evidence
+
+    repo = scenario.repo
+    # Add change on dev sharing file with hotfix
+    git(repo, "switch", "-q", "dev")
+    (repo / "settings.py").write_text("DEBUG = False\nTIMEOUT = 60\n# edit\nRETRIES = 3\nALLOWED_HOSTS = [\"example.com\"]\n")
+    git(repo, "add", "settings.py")
+    git(repo, "commit", "-m", "Manual edit of timeout")
+    cand = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    fake_client = FakeLLMClient()
+    # Assess cand against prod/uat/dev with LLM judge
+    ev = infer_evidence(repo, cand, use_llm=True, client=fake_client)
+    # LLM match must NEVER raise the evidence level!
+    assert ev.level == "UNVERIFIED"
+    assert any("possibly same change as" in rel and "LLM judge" in rel for rel in ev.related)
+
+
+def test_regression_d1_extract_references_validation_and_caching(scenario):
+    from trustmerge.identity import extract_references, _extract_ref_cache
+    from trustmerge.llm import ExtractedReferences
+
+    repo = scenario.repo
+    # Mock client returning valid and invalid hashes
+    class MockExtractLLM:
+        call_count = 0
+        def extract_references_from_message(self, msg: str):
+            self.call_count += 1
+            return ExtractedReferences(
+                commit_hashes=[
+                    scenario.hotfix,  # valid sha that resolves in repo
+                    "not-a-hash",  # invalid chars
+                    "12345",  # too short
+                    "f" * 40,  # valid hex format but does not resolve in repo
+                ],
+                pr_numbers=["GH-123", "#456", "PR-999"],  # GH-123 & #456 valid, PR-999 invalid
+            )
+
+    mock = MockExtractLLM()
+    msg = "backport this change from upstream"
+    # Clear cache
+    _extract_ref_cache.clear()
+
+    refs = extract_references(msg, use_llm=True, client=mock, repo=repo)
+    assert scenario.hotfix in refs
+    assert "not-a-hash" not in refs
+    assert "12345" not in refs
+    assert "f" * 40 not in refs  # discarded because it doesn't resolve in repo
+    assert "GH-123" in refs
+    assert "#456" in refs
+    assert "PR-999" not in refs
+
+    # Calling a second time must hit cache without invoking LLM extractor again
+    refs2 = extract_references(msg, use_llm=True, client=mock, repo=repo)
+    assert refs2 == refs
+    assert mock.call_count == 1
+

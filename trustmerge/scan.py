@@ -26,6 +26,7 @@ def scan_branch(
     config: Config = Config(),
     limit: int = 20,
     base: Optional[str] = None,
+    use_llm: bool = True,
 ) -> List[ScanRow]:
     """Return evidence rows for commits on *branch* that are not on *base*.
 
@@ -51,7 +52,7 @@ def scan_branch(
             continue
         sha, subject = line.split("\x1f", 1)
         if sha:
-            rows.append(ScanRow(sha, subject, assess(repo, sha, config)))
+            rows.append(ScanRow(sha, subject, assess(repo, sha, config, use_llm=use_llm)))
     return rows
 
 
@@ -100,13 +101,23 @@ def register(app: typer.Typer) -> None:
         limit: int = typer.Option(20, "--limit"),
         base: Optional[str] = typer.Option(None, "--base"),
         as_json: bool = typer.Option(False, "--json"),
+        use_llm: bool = typer.Option(
+            True, "--llm/--no-llm", help="Use LLM judge for fuzzy matching"
+        ),
+        verbose: bool = typer.Option(
+            False, "--verbose", "-v", help="Show verbose output including LLM usage"
+        ),
     ) -> None:
         """Show which changes reached which branches and their evidence level."""
+        from trustmerge.identity import get_llm_judge_calls, reset_llm_judge_calls
+        reset_llm_judge_calls()
         try:
-            rows = scan_branch(repo, branch, limit=limit, base=base)
+            rows = scan_branch(repo, branch, limit=limit, base=base, use_llm=use_llm)
         except typer.Exit:
             raise
         if as_json:
             typer.echo(json.dumps([row_to_dict(r) for r in rows], indent=2))
         else:
             typer.echo(format_rows(rows))
+            if verbose:
+                typer.echo(f"LLM used: judge x {get_llm_judge_calls()}")
