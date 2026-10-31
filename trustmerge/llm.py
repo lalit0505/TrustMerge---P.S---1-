@@ -1,4 +1,4 @@
-"""LLM client for judging fuzzy matches and generating briefings via Ollama (with fake fallback for CI)."""
+"""LLM client for judging fuzzy matches, extracting references, and generating briefings via Ollama."""
 
 import json
 import os
@@ -34,6 +34,19 @@ class ConflictBriefing(BaseModel):
     reasoning: str = Field(..., description="Detailed rationale based strictly on the provided evidence")
 
 
+class ExtractedReferences(BaseModel):
+    """Structured references extracted from an unstructured commit message."""
+
+    commit_hashes: list[str] = Field(
+        default_factory=list,
+        description="List of 7-40 character hexadecimal commit hashes referenced",
+    )
+    pr_numbers: list[str] = Field(
+        default_factory=list,
+        description="List of PR or issue references (e.g. GH-1234)",
+    )
+
+
 class LLMClient(Protocol):
     """Protocol for LLM interactions."""
 
@@ -63,6 +76,10 @@ class LLMClient(Protocol):
         related_notes: list[str] = [],
     ) -> ConflictBriefing:
         """Generate a plain-English briefing of the conflict based strictly on evidence."""
+        ...
+
+    def extract_references_from_message(self, message: str) -> ExtractedReferences:
+        """Extract commit hashes and PR numbers from an unstructured message."""
         ...
 
 
@@ -197,6 +214,35 @@ class OllamaClient:
                 reasoning=f"LLM briefing fallback due to: {exc}",
             )
 
+    def extract_references_from_message(self, message: str) -> ExtractedReferences:
+        prompt = (
+            "You are a Git provenance commit message parser. Extract any original or upstream "
+            "commit hashes (hexadecimal strings 7-40 characters) or GitHub PR numbers (like GH-1234) "
+            "from the following commit message.\n\n"
+            f"Commit message:\n{message[:4000]}\n\n"
+            "Return ONLY a valid JSON object matching this schema:\n"
+            "{\n"
+            '  "commit_hashes": ["hash1", ...],\n'
+            '  "pr_numbers": ["GH-1234", ...]\n'
+            "}"
+        )
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0.0, "num_ctx": 16384},
+        }
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(f"{self.base_url}/api/generate", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                raw_text = data.get("response", "{}")
+                return ExtractedReferences.model_validate_json(raw_text)
+        except Exception:
+            return ExtractedReferences()
+
 
 class FakeLLMClient:
     """Deterministic fake client for CI and tests where Ollama is not running."""
@@ -210,6 +256,7 @@ class FakeLLMClient:
         self.default_briefing = default_briefing
         self.calls: list[dict] = []
         self.briefing_calls: list[dict] = []
+        self.extract_calls: list[str] = []
 
     def judge_same_change(
         self,
@@ -303,6 +350,12 @@ class FakeLLMClient:
                 f"Ours has {ours_evidence_level} evidence while theirs is {theirs_evidence_level}."
             ),
         )
+
+    def extract_references_from_message(self, message: str) -> ExtractedReferences:
+        self.extract_calls.append(message)
+        hashes = re.findall(r"\b[0-9a-f]{7,40}\b", message, re.IGNORECASE)
+        prs = re.findall(r"\bGH-\d+\b", message)
+        return ExtractedReferences(commit_hashes=hashes, pr_numbers=prs)
 
 
 def get_llm_client() -> LLMClient:
