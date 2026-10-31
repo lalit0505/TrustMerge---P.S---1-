@@ -58,6 +58,56 @@ def test_best_evidence_level():
     assert best_evidence_level((make_c(UAT), make_c(PROD))) == PROD
 
 
+def test_regression_a4_weakest_evidence_level():
+    from trustmerge.report import weakest_evidence_level
+
+    def make_c(lvl: str) -> CommitAnalysis:
+        return CommitAnalysis(
+            sha="1" * 40,
+            short_sha="11111111",
+            subject="Sub",
+            level=lvl,
+            source="inferred",
+            detail="det",
+            reached=(),
+            related=(),
+        )
+
+    assert weakest_evidence_level(()) == UNKNOWN
+    # Side with any UNVERIFIED commit must be UNVERIFIED
+    assert weakest_evidence_level((make_c(PROD), make_c(UNVERIFIED))) == UNVERIFIED
+    # Side with any UNKNOWN commit must be UNKNOWN
+    assert weakest_evidence_level((make_c(UAT), make_c(UNKNOWN))) == UNKNOWN
+    # Only if all commits are PROD is it PROD
+    assert weakest_evidence_level((make_c(PROD), make_c(PROD))) == PROD
+
+
+def test_regression_a4_recommendation_when_unknown():
+    def make_side(level: str) -> SideAnalysis:
+        c = CommitAnalysis(
+            sha="a" * 40,
+            short_sha="aaaaaaaa",
+            subject="test",
+            level=level,
+            source="inferred",
+            detail="detail",
+            reached=(),
+            related=(),
+        )
+        return SideAnalysis(
+            label="side",
+            lines=("x = 1",),
+            commits=(c,),
+            weakest_level=level,
+            strongest_level=level,
+        )
+
+    rec = generate_recommendation(make_side(UNKNOWN), make_side(UNKNOWN))
+    assert "both UNKNOWN" in rec
+    assert "both UNVERIFIED" not in rec
+
+
+
 def test_recommendation_rules():
     def make_side(level: str, shas: tuple[str, ...] = ("a" * 40,), rel: tuple[str, ...] = ()) -> SideAnalysis:
         c = CommitAnalysis(

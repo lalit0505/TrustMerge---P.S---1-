@@ -38,7 +38,18 @@ class SideAnalysis:
     label: str
     lines: Tuple[str, ...]
     commits: Tuple[CommitAnalysis, ...]
-    best_level: str
+    weakest_level: str = ""
+    strongest_level: str = ""
+    best_level: str = ""
+
+    def __post_init__(self):
+        w = self.weakest_level or self.best_level or UNKNOWN
+        s = self.strongest_level or self.best_level or w
+        b = w
+        object.__setattr__(self, "weakest_level", w)
+        object.__setattr__(self, "strongest_level", s)
+        object.__setattr__(self, "best_level", b)
+
 
 
 @dataclass(frozen=True)
@@ -81,8 +92,15 @@ def analyze_commit(repo: Path, sha: str, config: Config = Config()) -> CommitAna
     )
 
 
+def weakest_evidence_level(commits: Tuple[CommitAnalysis, ...]) -> str:
+    """Return the weakest evidence level across a collection of commits (max rank)."""
+    if not commits:
+        return UNKNOWN
+    return max(commits, key=lambda c: rank(c.level)).level
+
+
 def best_evidence_level(commits: Tuple[CommitAnalysis, ...]) -> str:
-    """Return the strongest evidence level across a collection of commits."""
+    """Return the strongest evidence level across a collection of commits (min rank)."""
     if not commits:
         return UNKNOWN
     return min(commits, key=lambda c: rank(c.level)).level
@@ -101,44 +119,49 @@ def generate_recommendation(ours: SideAnalysis, theirs: SideAnalysis) -> str:
         if any(any(o[:8] in rel for o in ours_shas) for rel in c.related):
             same_logical = True
 
-    r_ours = rank(ours.best_level)
-    r_theirs = rank(theirs.best_level)
+    r_ours = rank(ours.weakest_level)
+    r_theirs = rank(theirs.weakest_level)
 
     if same_logical:
         if r_ours < r_theirs:
             return (
                 f"Both sides represent the same logical change. Recommend OURS: "
-                f"{ours.best_level} evidence vs {theirs.best_level} on THEIRS."
+                f"{ours.weakest_level} evidence vs {theirs.weakest_level} on THEIRS."
             )
         elif r_theirs < r_ours:
             return (
                 f"Both sides represent the same logical change. Recommend THEIRS: "
-                f"{theirs.best_level} evidence vs {ours.best_level} on OURS."
+                f"{theirs.weakest_level} evidence vs {ours.weakest_level} on OURS."
             )
         else:
             return (
-                f"Both sides represent the same logical change with equal evidence ({ours.best_level}). "
+                f"Both sides represent the same logical change with equal evidence ({ours.weakest_level}). "
                 "Verify whether hand edits are needed."
             )
 
     if r_ours < r_theirs:
         return (
-            f"Recommend OURS: {ours.best_level} evidence vs {theirs.best_level} on THEIRS. "
+            f"Recommend OURS: {ours.weakest_level} evidence vs {theirs.weakest_level} on THEIRS. "
             "Never accept unverified changes over tested ones without evidence."
         )
     elif r_theirs < r_ours:
         return (
-            f"Recommend THEIRS: {theirs.best_level} evidence vs {ours.best_level} on OURS. "
+            f"Recommend THEIRS: {theirs.weakest_level} evidence vs {ours.weakest_level} on OURS. "
             "Never accept unverified changes over tested ones without evidence."
         )
-    elif ours.best_level in (PROD, UAT, CI_PASSED):
+    elif ours.weakest_level in (PROD, UAT, CI_PASSED):
         return (
-            f"Both sides have {ours.best_level} evidence. "
+            f"Both sides have {ours.weakest_level} evidence. "
             "Manual review required to combine or choose changes."
+        )
+    elif ours.weakest_level == theirs.weakest_level:
+        return (
+            f"Neither side has recorded testing evidence (both {ours.weakest_level}). "
+            "Verification required before committing."
         )
     else:
         return (
-            "Neither side has recorded testing evidence (both UNVERIFIED). "
+            f"Neither side has recorded testing evidence ({ours.weakest_level} vs {theirs.weakest_level}). "
             "Verification required before committing."
         )
 
@@ -170,13 +193,15 @@ def build_conflict_report(
                 label=hunk.ours.label,
                 lines=hunk.ours.lines,
                 commits=ours_commits,
-                best_level=best_evidence_level(ours_commits),
+                weakest_level=weakest_evidence_level(ours_commits),
+                strongest_level=best_evidence_level(ours_commits),
             )
             theirs_side = SideAnalysis(
                 label=hunk.theirs.label,
                 lines=hunk.theirs.lines,
                 commits=theirs_commits,
-                best_level=best_evidence_level(theirs_commits),
+                weakest_level=weakest_evidence_level(theirs_commits),
+                strongest_level=best_evidence_level(theirs_commits),
             )
 
             rule_rec = generate_recommendation(ours_side, theirs_side)
@@ -189,18 +214,19 @@ def build_conflict_report(
                         file_path=hunk.file_path,
                         ours_label=ours_side.label,
                         ours_code="\n".join(ours_side.lines),
-                        ours_evidence_level=ours_side.best_level,
+                        ours_evidence_level=ours_side.weakest_level,
                         ours_evidence_detail="; ".join(c.detail for c in ours_side.commits) or "none",
                         ours_reached=list({r for c in ours_side.commits for r in c.reached}),
                         theirs_label=theirs_side.label,
                         theirs_code="\n".join(theirs_side.lines),
-                        theirs_evidence_level=theirs_side.best_level,
+                        theirs_evidence_level=theirs_side.weakest_level,
                         theirs_evidence_detail="; ".join(c.detail for c in theirs_side.commits) or "none",
                         theirs_reached=list({r for c in theirs_side.commits for r in c.reached}),
                         related_notes=related_all,
                     )
                 except Exception:
                     briefing = None
+
 
             final_rec = briefing.recommendation if briefing is not None else rule_rec
 
@@ -247,8 +273,15 @@ _LEVEL_COLORS = {
 def _format_side_text(side: SideAnalysis) -> str:
     """Format the text block for one side in the conflict table."""
     lines: list[str] = []
-    lines.append(f"Level: [{_LEVEL_COLORS.get(side.best_level, 'white')}]{side.best_level}[/]")
+    if side.strongest_level and side.strongest_level != side.weakest_level:
+        lines.append(
+            f"Level: [{_LEVEL_COLORS.get(side.weakest_level, 'white')}]{side.weakest_level}[/] "
+            f"(strongest: {side.strongest_level})"
+        )
+    else:
+        lines.append(f"Level: [{_LEVEL_COLORS.get(side.weakest_level, 'white')}]{side.weakest_level}[/]")
     lines.append("")
+
     lines.append("[bold]Code:[/]")
     if side.lines:
         for l in side.lines:
