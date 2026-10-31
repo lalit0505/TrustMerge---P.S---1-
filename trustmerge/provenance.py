@@ -38,11 +38,28 @@ def short(sha: str) -> str:
 
 
 def resolve_ref(repo: Path, name: str) -> Optional[str]:
-    """Return a full refname for *name* (local first, then remote), or ``None``."""
-    for ref in (f"refs/heads/{name}", f"refs/remotes/origin/{name}"):
-        out = run_git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
-        if out:
-            return ref
+    """Return a full refname for *name* (local vs origin: prefers descendant; if diverged prefers origin), or ``None``."""
+    local_ref = f"refs/heads/{name}"
+    remote_ref = f"refs/remotes/origin/{name}"
+
+    local_sha = run_git(repo, "rev-parse", "--verify", "--quiet", local_ref, check=False)
+    remote_sha = run_git(repo, "rev-parse", "--verify", "--quiet", remote_ref, check=False)
+
+    if local_sha and remote_sha:
+        # Both exist: check descendant relationship
+        if is_ancestor(repo, remote_ref, local_ref) and not is_ancestor(repo, local_ref, remote_ref):
+            # local is strictly ahead of remote
+            return local_ref
+        elif is_ancestor(repo, local_ref, remote_ref):
+            # remote is ahead of local (or equal)
+            return remote_ref
+        else:
+            # diverged: prefer origin
+            return remote_ref
+    elif local_sha:
+        return local_ref
+    elif remote_sha:
+        return remote_ref
     return None
 
 
