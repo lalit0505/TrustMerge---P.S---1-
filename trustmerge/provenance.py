@@ -6,7 +6,8 @@ from typing import Optional, Tuple
 
 from trustmerge.git import GitError, is_ancestor, rev_parse, run_git
 from trustmerge.identity import find_equivalents
-from trustmerge.levels import CI_PASSED, PROD, UAT, UNKNOWN, UNVERIFIED
+from trustmerge.levels import CI_PASSED, LEVEL_ORDER, PROD, UAT, UNKNOWN, UNVERIFIED, rank
+from trustmerge.notes import get_recorded_evidence
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,39 @@ def infer_evidence(repo: Path, sha: str, config: Config = Config()) -> Evidence:
 def assess(repo: Path, sha: str, config: Config = Config()) -> Evidence:
     """Public entry-point: return evidence for *sha*.
 
-    Today this is purely inferred from Git.  Future PRs will consult
-    ``git notes`` first and fall back to inference.
+    Checks recorded git notes and evidence files first.
+    Falls back to Git inference when no recorded evidence is present.
     """
-    return infer_evidence(repo, sha, config)
+    sha = rev_parse(repo, sha)
+    inferred = infer_evidence(repo, sha, config)
+    recorded = get_recorded_evidence(repo, sha)
+    if not recorded:
+        return inferred
+
+    # Pick the strongest recorded evidence
+    best = min(
+        recorded,
+        key=lambda r: rank(r.level.upper()) if r.level.upper() in LEVEL_ORDER else 999,
+    )
+    rec_level = best.level.upper()
+
+    if rank(rec_level) <= rank(inferred.level):
+        return Evidence(
+            sha=sha,
+            level=rec_level,
+            source="recorded",
+            detail=best.evidence,
+            related=inferred.related,
+            reached=inferred.reached,
+        )
+    else:
+        # Inferred evidence is stronger (e.g. already in PROD)
+        related_extra = (f"recorded {rec_level}: {best.evidence}",)
+        return Evidence(
+            sha=sha,
+            level=inferred.level,
+            source=inferred.source,
+            detail=inferred.detail,
+            related=related_extra + inferred.related,
+            reached=inferred.reached,
+        )
