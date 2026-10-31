@@ -133,3 +133,113 @@ def test_parse_conflicted_file_missing_on_disk(tmp_path):
     assert len(cf.hunks) == 1
     assert cf.hunks[0].ours.commits == ("abc",)
     assert cf.hunks[0].theirs.commits == ("def",)
+
+
+def test_regression_b1_auto_merge_above_conflict_blames_correct_ours_commit(tmp_path):
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    run("init", "-b", "main")
+    run("config", "user.name", "Test")
+    run("config", "user.email", "test@example.com")
+    run("config", "commit.gpgsign", "false")
+
+    code_base = (
+        "line 1\nline 2\nline 3\nTARGET_VAR = \"base\"\n"
+        "line 5\nline 6\nline 7\nline 8\nline 9\nline 10\n"
+    )
+    (repo / "code.py").write_text(code_base)
+    run("add", "code.py")
+    run("commit", "-m", "Base commit")
+    base_sha = run("rev-parse", "HEAD").stdout.strip()
+
+    run("checkout", "-b", "feature-ours")
+    code_ours = (
+        "line 1\nline 2\nline 3\nTARGET_VAR = \"ours_value\"\n"
+        "line 5\nline 6\nline 7\nline 8\nline 9\nline 10\n"
+    )
+    (repo / "code.py").write_text(code_ours)
+    run("add", "code.py")
+    run("commit", "-m", "Ours edit")
+    ours_sha = run("rev-parse", "HEAD").stdout.strip()
+
+    run("checkout", "main")
+    run("checkout", "-b", "feature-theirs")
+    # 3 lines added above the conflict (auto-merges cleanly)
+    code_theirs = (
+        "theirs auto 1\ntheirs auto 2\ntheirs auto 3\n"
+        "line 1\nline 2\nline 3\nTARGET_VAR = \"theirs_value\"\n"
+        "line 5\nline 6\nline 7\nline 8\nline 9\nline 10\n"
+    )
+    (repo / "code.py").write_text(code_theirs)
+    run("add", "code.py")
+    run("commit", "-m", "Theirs edit")
+    theirs_sha = run("rev-parse", "HEAD").stdout.strip()
+
+    run("checkout", "feature-ours")
+    subprocess.run(["git", "merge", "feature-theirs"], cwd=repo, capture_output=True)
+
+    state = find_conflicts(repo)
+    assert state is not None
+    hunk = state.files[0].hunks[0]
+
+    # Target line was line 4 in stage-2 (ours)
+    assert hunk.ours.start_line == 4
+    assert hunk.ours.end_line == 4
+    # Crucially: ours commits must contain ours_sha and NOT base_sha
+    assert ours_sha in hunk.ours.commits
+    assert base_sha not in hunk.ours.commits
+
+
+def test_regression_b2_blame_parsing_ignores_tabbed_lines_with_hex():
+    from trustmerge.conflicts import blame_range
+    # When output contains lines starting with \t that have 40-char hex
+    porcelain_sample = (
+        "a" * 40 + " 1 1 1\n"
+        "author Test\n"
+        "\t" + "b" * 40 + " some fake code\n"
+    )
+    # Testing that 'b'*40 is not parsed as a commit
+    import unittest.mock as mock
+    with mock.patch("trustmerge.conflicts.run_git", return_value=porcelain_sample):
+        commits = blame_range(Path("."), "HEAD", "file.py", 1, 1)
+        assert commits == ["a" * 40]
+        assert "b" * 40 not in commits
+
+
+def test_regression_b3_marker_parsing_state_transitions(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Markdown file with ======= heading and lookalikes outside conflict
+    content = (
+        "Document Title\n"
+        "==============\n"
+        "Some intro text.\n"
+        "Heading 2\n"
+        "=======\n"
+        "More text.\n"
+        "<<<<<<< HEAD\n"
+        "ours setting\n"
+        "=======\n"
+        "theirs setting\n"
+        ">>>>>>> incoming\n"
+        "Section Title\n"
+        "=======\n"
+        "Body text\n"
+        ">>>>>>> not a marker\n"
+    )
+    (repo / "doc.md").write_text(content)
+    cf = parse_conflicted_file(repo, "doc.md", ours_head="1" * 40, theirs_head="2" * 40)
+    # Exactly ONE conflict hunk, not two
+    assert len(cf.hunks) == 1
+    hunk = cf.hunks[0]
+    assert hunk.ours.lines == ("ours setting",)
+    assert hunk.theirs.lines == ("theirs setting",)
+
+

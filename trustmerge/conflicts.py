@@ -96,6 +96,9 @@ def is_conflicted(repo: Path) -> bool:
 # ── git blame ─────────────────────────────────────────────────────────
 
 
+import difflib
+
+
 def blame_range(
     repo: Path, commit: str, file_path: str, start_line: int, end_line: int
 ) -> list[str]:
@@ -118,8 +121,10 @@ def blame_range(
 
     commits: list[str] = []
     for line in out.splitlines():
+        if line.startswith("\t"):
+            continue
         parts = line.split()
-        if parts and len(parts[0]) == 40:
+        if parts and len(parts[0]) == 40 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
             sha = parts[0]
             if sha not in commits:
                 commits.append(sha)
@@ -127,6 +132,35 @@ def blame_range(
 
 
 # ── parsing hunks ─────────────────────────────────────────────────────
+
+
+def _map_hunk_range(
+    working_lines: list[str], stage_lines: list[str], w_start: int, w_end: int
+) -> tuple[int, int]:
+    """Map hunk line range [w_start, w_end) in working file to 1-based start..end in stage_lines."""
+    if w_start >= w_end or not stage_lines:
+        return 0, 0
+    matcher = difflib.SequenceMatcher(None, working_lines, stage_lines)
+    blocks = matcher.get_matching_blocks()
+    stage_indices: list[int] = []
+    for w_i in range(w_start, w_end):
+        for a, b, size in blocks:
+            if a <= w_i < a + size:
+                stage_indices.append(b + (w_i - a))
+                break
+    if stage_indices:
+        return min(stage_indices) + 1, max(stage_indices) + 1
+
+    # Fallback to nearest matching block before w_start
+    prev_end = 0
+    for a, b, size in blocks:
+        if a + size <= w_start:
+            prev_end = b + size
+        else:
+            break
+    s = prev_end + 1
+    e = min(len(stage_lines), prev_end + (w_end - w_start))
+    return s, e
 
 
 def parse_conflicted_file(
@@ -163,17 +197,25 @@ def parse_conflicted_file(
     except OSError:
         raw_lines = []
 
+    stage2_lines = stage2.splitlines() if stage2 else []
+    stage3_lines = stage3.splitlines() if stage3 else []
+
     hunks: list[ConflictHunk] = []
-    i2, i3 = 0, 0
     in_ours, in_base, in_theirs = False, False, False
     ours_lines: list[str] = []
     theirs_lines: list[str] = []
     base_lines: list[str] = []
-    ours_start, ours_label = 1, "HEAD"
-    theirs_start, theirs_label = 1, (theirs_head or "theirs")
+    ours_label = "HEAD"
+    theirs_label = theirs_head or "theirs"
+    w_ours_start = 0
+    w_ours_end = 0
+    w_theirs_start = 0
+    w_theirs_end = 0
 
-    for line in raw_lines:
-        if line.startswith("<<<<<<<"):
+    for idx, line in enumerate(raw_lines):
+        # Strict state transitions:
+        # <<<<<<< is valid only when NOT in a conflict
+        if (line.startswith("<<<<<<< ") or line == "<<<<<<<") and not (in_ours or in_base or in_theirs):
             in_ours = True
             in_base = False
             in_theirs = False
@@ -182,37 +224,47 @@ def parse_conflicted_file(
             base_lines = []
             parts = line.split(maxsplit=1)
             ours_label = parts[1].strip() if len(parts) > 1 else "HEAD"
-            ours_start = i2 + 1
-        elif line.startswith("|||||||"):
+            w_ours_start = idx + 1
+            w_ours_end = idx + 1
+        # ||||||| is valid only inside ours
+        elif (line.startswith("||||||| ") or line == "|||||||") and in_ours:
+            w_ours_end = idx
             in_ours = False
             in_base = True
             in_theirs = False
             base_lines = []
-        elif line.startswith("======="):
+        # ======= is valid only inside ours or base
+        elif (line.startswith("=======") or line == "=======") and (in_ours or in_base):
+            if in_ours:
+                w_ours_end = idx
             in_ours = False
             in_base = False
             in_theirs = True
             theirs_lines = []
-            theirs_start = i3 + 1
-        elif line.startswith(">>>>>>>"):
+            w_theirs_start = idx + 1
+            w_theirs_end = idx + 1
+        # >>>>>>> is valid only inside theirs
+        elif (line.startswith(">>>>>>> ") or line.startswith(">>>>>>>")) and in_theirs:
             in_ours = False
             in_base = False
             in_theirs = False
+            w_theirs_end = idx
             parts = line.split(maxsplit=1)
             theirs_label = parts[1].strip() if len(parts) > 1 else (theirs_head or "theirs")
 
-            ours_end = i2
-            theirs_end = i3
+            # Map line ranges into stage2 and stage3
+            ours_start, ours_end = _map_hunk_range(raw_lines, stage2_lines, w_ours_start, w_ours_end)
+            theirs_start, theirs_end = _map_hunk_range(raw_lines, stage3_lines, w_theirs_start, w_theirs_end)
 
             # Attribute commits via git blame
-            if ours_lines and ours_head:
+            if ours_lines and ours_head and ours_start > 0:
                 ours_commits = blame_range(repo, ours_head, file_path, ours_start, ours_end)
             elif ours_head:
                 ours_commits = [ours_head]
             else:
                 ours_commits = []
 
-            if theirs_lines and theirs_head:
+            if theirs_lines and theirs_head and theirs_start > 0:
                 theirs_commits = blame_range(repo, theirs_head, file_path, theirs_start, theirs_end)
             elif theirs_head:
                 theirs_commits = [theirs_head]
@@ -241,15 +293,13 @@ def parse_conflicted_file(
             )
         elif in_ours:
             ours_lines.append(line)
-            i2 += 1
+            w_ours_end = idx + 1
         elif in_base:
             base_lines.append(line)
         elif in_theirs:
             theirs_lines.append(line)
-            i3 += 1
-        else:
-            i2 += 1
-            i3 += 1
+            w_theirs_end = idx + 1
+
 
     return ConflictedFile(
         path=file_path,
