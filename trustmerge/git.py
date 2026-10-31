@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Union
@@ -11,10 +12,12 @@ class GitError(Exception):
 def run_git(repo: Union[str, Path], *args: str, check: bool = True) -> str:
     """
     Run `git <args>` in directory `repo` with subprocess (capture_output, text, utf-8, replace).
-    Always passes `-c core.quotepath=false`.
+    Always passes `-c core.quotepath=false` and sets GIT_TERMINAL_PROMPT=0.
     Return stdout with trailing whitespace stripped. If the command fails and check is True,
     raise GitError that includes stderr. If check is False, never raise and return stdout.
     """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
     result = subprocess.run(
         ["git", "-c", "core.quotepath=false", *args],
         cwd=repo,
@@ -22,6 +25,7 @@ def run_git(repo: Union[str, Path], *args: str, check: bool = True) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
     stdout = result.stdout.strip()
     if result.returncode != 0 and check:
