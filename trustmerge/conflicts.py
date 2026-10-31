@@ -77,13 +77,15 @@ def get_conflict_type(repo: Path) -> str:
 
 def list_conflicted_paths(repo: Path) -> list[str]:
     """Return a list of file paths that currently have unmerged stages."""
-    out = run_git(repo, "ls-files", "-u", check=False)
+    out = run_git(repo, "ls-files", "-u", "-z", check=False)
     paths: list[str] = []
-    for line in out.splitlines():
-        parts = line.split(maxsplit=3)
-        if len(parts) >= 4:
-            path = parts[3].strip()
-            if path not in paths:
+    for entry in out.split("\0"):
+        if not entry.strip():
+            continue
+        parts = entry.split("\t", 1)
+        if len(parts) >= 2:
+            path = parts[1].strip()
+            if path and path not in paths:
                 paths.append(path)
     return paths
 
@@ -167,11 +169,44 @@ def parse_conflicted_file(
     repo: Path, file_path: str, ours_head: str, theirs_head: Optional[str]
 ) -> ConflictedFile:
     """Parse conflict markers in *file_path* and attribute each side via git blame."""
+    disk_file = Path(repo) / file_path
+
+    # Detect binary conflict via numstat or NUL bytes
+    is_binary = False
+    numstat = run_git(repo, "diff", "--numstat", f":2:{file_path}", f":3:{file_path}", check=False)
+    if "-\t-" in numstat:
+        is_binary = True
+    if not is_binary and disk_file.is_file():
+        try:
+            chunk = disk_file.read_bytes()[:8192]
+            if b"\x00" in chunk:
+                is_binary = True
+        except OSError:
+            pass
+
+    if is_binary:
+        ours_commits = [ours_head] if ours_head else []
+        theirs_commits = [theirs_head] if theirs_head else []
+        hunk = ConflictHunk(
+            file_path=file_path,
+            ours=ConflictSide("ours", ("binary conflict: cannot show hunks",), tuple(ours_commits), 0, 0),
+            theirs=ConflictSide("theirs", ("binary conflict: cannot show hunks",), tuple(theirs_commits), 0, 0),
+            base_lines=(),
+        )
+        return ConflictedFile(
+            path=file_path,
+            hunks=(hunk,),
+            ours_head=ours_head,
+            theirs_head=theirs_head,
+            stage1_content=None,
+            stage2_content="",
+            stage3_content="",
+        )
+
     stage1 = run_git(repo, "show", f":1:{file_path}", check=False) or None
     stage2 = run_git(repo, "show", f":2:{file_path}", check=False)
     stage3 = run_git(repo, "show", f":3:{file_path}", check=False)
 
-    disk_file = Path(repo) / file_path
     if not disk_file.is_file():
         # Modify/delete conflict
         ours_commits = [ours_head] if ours_head else []
@@ -191,6 +226,7 @@ def parse_conflicted_file(
             stage2_content=stage2,
             stage3_content=stage3,
         )
+
 
     try:
         raw_lines = disk_file.read_text(errors="replace").splitlines()

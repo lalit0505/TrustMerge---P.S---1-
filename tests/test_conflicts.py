@@ -243,3 +243,96 @@ def test_regression_b3_marker_parsing_state_transitions(tmp_path):
     assert hunk.theirs.lines == ("theirs setting",)
 
 
+def test_regression_b4_non_ascii_filenames(tmp_path):
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        return subprocess.run(
+            ["git", "-c", "core.quotepath=false", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    run("init", "-b", "main")
+    run("config", "user.name", "Test")
+    run("config", "user.email", "test@example.com")
+    run("config", "commit.gpgsign", "false")
+
+    filename = "café_données.txt"
+    (repo / filename).write_text("initial content\n", encoding="utf-8")
+    run("add", filename)
+    run("commit", "-m", "Initial")
+
+    run("checkout", "-b", "feature-ours")
+    (repo / filename).write_text("ours content\n", encoding="utf-8")
+    run("add", filename)
+    run("commit", "-m", "Ours edit")
+
+    run("checkout", "main")
+    run("checkout", "-b", "feature-theirs")
+    (repo / filename).write_text("theirs content\n", encoding="utf-8")
+    run("add", filename)
+    run("commit", "-m", "Theirs edit")
+
+    run("checkout", "feature-ours")
+    subprocess.run(["git", "merge", "feature-theirs"], cwd=repo, capture_output=True)
+
+    paths = list_conflicted_paths(repo)
+    assert filename in paths
+    # Must NOT be quoted or escaped
+    assert not any(p.startswith('"') for p in paths)
+
+    state = find_conflicts(repo)
+    assert state is not None
+    assert state.files[0].path == filename
+
+
+def test_regression_b5_binary_conflict_no_crash(tmp_path):
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True
+        )
+
+    run("init", "-b", "main")
+    run("config", "user.name", "Test")
+    run("config", "user.email", "test@example.com")
+    run("config", "commit.gpgsign", "false")
+
+    bin_file = "image.png"
+    (repo / bin_file).write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00base")
+    run("add", bin_file)
+    run("commit", "-m", "Base binary")
+
+    run("checkout", "-b", "feature-ours")
+    (repo / bin_file).write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00ours")
+    run("add", bin_file)
+    run("commit", "-m", "Ours binary")
+
+    run("checkout", "main")
+    run("checkout", "-b", "feature-theirs")
+    (repo / bin_file).write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00theirs")
+    run("add", bin_file)
+    run("commit", "-m", "Theirs binary")
+
+    run("checkout", "feature-ours")
+    subprocess.run(["git", "merge", "feature-theirs"], cwd=repo, capture_output=True)
+
+    state = find_conflicts(repo)
+    assert state is not None
+    assert len(state.files) == 1
+    file = state.files[0]
+    assert file.path == bin_file
+    hunk = file.hunks[0]
+    assert "binary conflict: cannot show hunks" in hunk.ours.lines[0]
+
+
+
