@@ -1,6 +1,7 @@
 """``git prov finish`` — finalize conflict resolution with standard trailers and a note."""
 
 from pathlib import Path
+import re
 from typing import Optional, Tuple
 
 import typer
@@ -10,6 +11,73 @@ from trustmerge.git import GitError, rev_parse, run_git
 from trustmerge.levels import CI_PASSED, PROD, RECORDABLE, UAT, rank
 from trustmerge.notes import NoteRecord, write_note
 from trustmerge.provenance import assess
+
+
+def _sanitize_trailer_value(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    return re.sub(r"[\r\n\x00-\x1f\x7f-\x9f]+", " ", val).strip()
+
+
+
+def _merge_trailers(base_msg: str, new_trailers: list[tuple[str, str]]) -> str:
+    lines = base_msg.rstrip().splitlines()
+
+    trailer_start = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i].strip()
+        if not line:
+            trailer_start = i + 1
+            break
+        if ":" in line and re.match(r"^[A-Za-z0-9_-]+:\s*", line):
+            trailer_start = i
+        else:
+            trailer_start = i + 1
+            break
+
+    existing_body = lines[:trailer_start]
+    existing_trailers = lines[trailer_start:]
+
+    while existing_body and not existing_body[-1].strip():
+        existing_body.pop()
+
+    final_trailers: list[str] = []
+    seen_keys: set[str] = set()
+    new_dict = {k.lower(): f"{k}: {v}" for k, v in new_trailers}
+
+    for t_line in existing_trailers:
+        key = t_line.split(":", 1)[0].strip().lower()
+        if key in new_dict:
+            final_trailers.append(new_dict[key])
+            seen_keys.add(key)
+        else:
+            final_trailers.append(t_line)
+            seen_keys.add(key)
+
+    for k, v in new_trailers:
+        if k.lower() not in seen_keys:
+            final_trailers.append(f"{k}: {v}")
+            seen_keys.add(k.lower())
+
+    # Ensure "Tested-in:" appears at most once
+    tested_in_indices = [
+        idx for idx, line in enumerate(final_trailers)
+        if line.strip().lower().startswith("tested-in:")
+    ]
+    if len(tested_in_indices) > 1:
+        for idx in reversed(tested_in_indices[:-1]):
+            del final_trailers[idx]
+
+    body_str = "\n".join(existing_body)
+    trailers_str = "\n".join(final_trailers)
+
+    if body_str and trailers_str:
+        return f"{body_str}\n\n{trailers_str}\n"
+    elif trailers_str:
+        return f"{trailers_str}\n"
+    else:
+        return f"{body_str}\n"
+
 
 
 def _get_kept_commits(
@@ -148,8 +216,12 @@ def finish_conflict(
 
     ours_head = run_git(repo, "rev-parse", "HEAD", check=False)
 
+    if provenance:
+        provenance = _sanitize_trailer_value(provenance)
+
     norm_level: Optional[str] = None
     if tested_in is not None:
+        tested_in = _sanitize_trailer_value(tested_in)
         if not evidence or not evidence.strip():
             raise GitError(
                 "--evidence is required when --tested-in is specified.",
@@ -201,11 +273,11 @@ def finish_conflict(
         else:
             provenance = "manual resolution"
 
-    trailers = [f"Provenance: {provenance}"]
+    trailers_to_add: list[tuple[str, str]] = [("Provenance", provenance)]
     if norm_level is not None:
-        trailers.append(f"Tested-in: {norm_level.lower()}")
+        trailers_to_add.append(("Tested-in", norm_level.lower()))
 
-    full_message = f"{base_msg}\n\n" + "\n".join(trailers) + "\n"
+    full_message = _merge_trailers(base_msg, trailers_to_add)
 
     # Create the Git commit
     run_git(repo, "commit", "-m", full_message)
