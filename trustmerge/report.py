@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 import typer
@@ -273,19 +274,22 @@ _LEVEL_COLORS = {
 def _format_side_text(side: SideAnalysis) -> str:
     """Format the text block for one side in the conflict table."""
     lines: list[str] = []
+    w_lvl = escape(side.weakest_level)
+    s_lvl = escape(side.strongest_level)
+    color = _LEVEL_COLORS.get(side.weakest_level, 'white')
     if side.strongest_level and side.strongest_level != side.weakest_level:
         lines.append(
-            f"Level: [{_LEVEL_COLORS.get(side.weakest_level, 'white')}]{side.weakest_level}[/] "
-            f"(strongest: {side.strongest_level})"
+            f"Level: [{color}]{w_lvl}[/] "
+            f"(strongest: {s_lvl})"
         )
     else:
-        lines.append(f"Level: [{_LEVEL_COLORS.get(side.weakest_level, 'white')}]{side.weakest_level}[/]")
+        lines.append(f"Level: [{color}]{w_lvl}[/]")
     lines.append("")
 
     lines.append("[bold]Code:[/]")
     if side.lines:
         for l in side.lines:
-            lines.append(f"  {l}")
+            lines.append(f"  {escape(l)}")
     else:
         lines.append("  (deleted)")
 
@@ -293,11 +297,12 @@ def _format_side_text(side: SideAnalysis) -> str:
     lines.append("[bold]Origin Commits:[/]")
     if side.commits:
         for c in side.commits:
-            lines.append(f"  • {c.short_sha} {c.subject}")
-            lines.append(f"    {c.source}: {c.detail}")
-            lines.append(f"    reached: {', '.join(c.reached) or 'none'}")
+            lines.append(f"  • {escape(c.short_sha)} {escape(c.subject)}")
+            lines.append(f"    {escape(c.source)}: {escape(c.detail)}")
+            reached_str = escape(', '.join(c.reached) or 'none')
+            lines.append(f"    reached: {reached_str}")
             for rel in c.related:
-                lines.append(f"    note: {rel}")
+                lines.append(f"    note: {escape(rel)}")
     else:
         lines.append("  (no origin commits found)")
     return "\n".join(lines)
@@ -309,15 +314,15 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
         console = Console()
 
     console.print()
-    header_title = f"TrustMerge Conflict Analysis ({report.operation.upper()})"
+    header_title = f"TrustMerge Conflict Analysis ({escape(report.operation.upper())})"
     rebase_note = ""
     if report.operation == "rebase":
         rebase_note = "\n[yellow]Note: During rebase, OURS is upstream/target and THEIRS is your rebased commit (swapped by Git).[/]"
 
     console.print(
         Panel(
-            f"Conflict between OURS ([cyan]{short(report.ours_head)}[/]) and "
-            f"THEIRS ([magenta]{short(report.theirs_head or 'unknown')}[/])\n"
+            f"Conflict between OURS ([cyan]{escape(short(report.ours_head))}[/]) and "
+            f"THEIRS ([magenta]{escape(short(report.theirs_head or 'unknown'))}[/])\n"
             f"Conflicted hunks: {len(report.hunks)}"
             f"{rebase_note}",
             title=f"[bold]{header_title}[/]",
@@ -325,16 +330,15 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
         )
     )
 
-
     for idx, hunk in enumerate(report.hunks, 1):
         table = Table(
-            title=f"File: {hunk.file_path} (Hunk {idx})",
+            title=f"File: {escape(hunk.file_path)} (Hunk {idx})",
             expand=True,
             show_header=True,
             header_style="bold",
         )
-        table.add_column(f"OURS: {hunk.ours.label}", style="cyan", ratio=1)
-        table.add_column(f"THEIRS: {hunk.theirs.label}", style="magenta", ratio=1)
+        table.add_column(f"OURS: {escape(hunk.ours.label)}", style="cyan", ratio=1)
+        table.add_column(f"THEIRS: {escape(hunk.theirs.label)}", style="magenta", ratio=1)
 
         table.add_row(
             _format_side_text(hunk.ours),
@@ -344,11 +348,11 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
 
         if hunk.briefing:
             briefing_text = (
-                f"[bold]Summary:[/]\n{hunk.briefing.summary}\n\n"
-                f"[bold]Ours ({hunk.ours.label}):[/]\n{hunk.briefing.ours_assessment}\n\n"
-                f"[bold]Theirs ({hunk.theirs.label}):[/]\n{hunk.briefing.theirs_assessment}\n\n"
-                f"[bold]Recommendation:[/]\n{hunk.briefing.recommendation}\n\n"
-                f"[bold]Reasoning:[/]\n{hunk.briefing.reasoning}"
+                f"[bold]Summary:[/]\n{escape(hunk.briefing.summary)}\n\n"
+                f"[bold]Ours ({escape(hunk.ours.label)}):[/]\n{escape(hunk.briefing.ours_assessment)}\n\n"
+                f"[bold]Theirs ({escape(hunk.theirs.label)}):[/]\n{escape(hunk.briefing.theirs_assessment)}\n\n"
+                f"[bold]Recommendation:[/]\n{escape(hunk.briefing.recommendation)}\n\n"
+                f"[bold]Reasoning:[/]\n{escape(hunk.briefing.reasoning)}"
             )
             briefing_panel = Panel(
                 briefing_text,
@@ -358,7 +362,7 @@ def render_report(report: ConflictReport, console: Optional[Console] = None) -> 
             console.print(briefing_panel)
         else:
             rec_panel = Panel(
-                hunk.recommendation,
+                escape(hunk.recommendation),
                 title="[bold yellow]💡 Recommendation[/]",
                 border_style="yellow",
             )

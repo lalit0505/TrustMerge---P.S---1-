@@ -158,3 +158,60 @@ def test_regression_a3_rank_and_assess_unknown_level_does_not_raise(scenario):
     assert rank("UNKNOWN_FOO") >= 999
     assert rank(None) >= 999
 
+
+def test_regression_b8_rich_markup_escape():
+    from rich.console import Console
+    from trustmerge.report import (
+        CommitAnalysis,
+        ConflictReport,
+        HunkAnalysis,
+        SideAnalysis,
+        render_report,
+    )
+
+    console = Console(record=True, width=120)
+    c_ours = CommitAnalysis(
+        sha="1111111111111111111111111111111111111111",
+        short_sha="1111111",
+        subject="[WIP] fix [/x]",
+        level="UNVERIFIED",
+        source="unverified",
+        detail="details [/tag]",
+        reached=("[/reached]",),
+        related=("[/note]",),
+    )
+    side_ours = SideAnalysis(
+        label="ours [/label]",
+        lines=('p = "[/oops]"',),
+        commits=(c_ours,),
+        weakest_level="UNVERIFIED",
+    )
+    side_theirs = SideAnalysis(
+        label="theirs [/label2]",
+        lines=('q = "[/bar]"',),
+        commits=(),
+        weakest_level="UNKNOWN",
+    )
+    hunk = HunkAnalysis(
+        file_path="src/[bad_path]/file.py",
+        ours=side_ours,
+        theirs=side_theirs,
+        recommendation="Recommendation with [/bracket]",
+    )
+    report = ConflictReport(
+        operation="merge [/op]",
+        ours_head="1111111111111111111111111111111111111111",
+        theirs_head="2222222222222222222222222222222222222222",
+        hunks=(hunk,),
+    )
+
+    # Must render without throwing rich.errors.MarkupError
+    render_report(report, console=console)
+    output = console.export_text()
+
+    assert 'p = "[/oops]"' in output
+    assert "[WIP] fix [/x]" in output
+    assert "src/[bad_path]/file.py" in output
+    assert "Recommendation with [/bracket]" in output
+
+
