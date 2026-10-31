@@ -1,4 +1,7 @@
+import os
 import pytest
+
+os.environ.setdefault("TRUSTMERGE_LLM", "fake")
 
 from fixtures import build_scenario
 

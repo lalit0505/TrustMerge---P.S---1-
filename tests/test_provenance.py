@@ -87,3 +87,27 @@ def test_evidence_dataclass_is_frozen():
         assert False, "should not be mutable"
     except AttributeError:
         pass
+
+
+def test_regression_b9_resolve_ref_descendant_and_diverged(scenario):
+    repo = scenario.repo
+    # Create remote ref origin/feature pointing to scenario.initial
+    git(repo, "update-ref", "refs/remotes/origin/feature", scenario.initial)
+    # Create local ref feature pointing to scenario.hotfix (which is a descendant of initial)
+    git(repo, "update-ref", "refs/heads/feature", scenario.hotfix)
+
+    # Local is descendant of remote -> must choose local
+    assert resolve_ref(repo, "feature") == "refs/heads/feature"
+
+    # Now make remote a descendant of local
+    git(repo, "update-ref", "refs/heads/feature", scenario.initial)
+    git(repo, "update-ref", "refs/remotes/origin/feature", scenario.hotfix)
+    # Remote is descendant of local -> must choose remote
+    assert resolve_ref(repo, "feature") == "refs/remotes/origin/feature"
+
+    # Now diverge: local points to hotfix, remote points to dev_change
+    git(repo, "update-ref", "refs/heads/feature", scenario.hotfix)
+    git(repo, "update-ref", "refs/remotes/origin/feature", scenario.dev_change)
+    # Diverged -> must prefer origin
+    assert resolve_ref(repo, "feature") == "refs/remotes/origin/feature"
+

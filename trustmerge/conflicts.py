@@ -56,11 +56,21 @@ class ConflictState:
 
 
 def get_theirs_head(repo: Path) -> Optional[str]:
-    """Return the incoming commit SHA for merge, cherry-pick, or revert."""
-    for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+    """Return the incoming commit SHA for merge, cherry-pick, revert, or rebase."""
+    for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
         out = run_git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
         if out:
             return out
+
+    # Check rebase-merge / rebase-apply stopped-sha
+    for subpath in ("rebase-merge/stopped-sha", "rebase-apply/stopped-sha"):
+        git_path_rel = run_git(repo, "rev-parse", "--git-path", subpath, check=False).strip()
+        if git_path_rel:
+            f = Path(repo) / git_path_rel
+            if f.is_file():
+                sha = f.read_text(encoding="utf-8", errors="replace").strip()
+                if sha:
+                    return sha
     return None
 
 
@@ -72,18 +82,27 @@ def get_conflict_type(repo: Path) -> str:
         return "cherry-pick"
     if run_git(repo, "rev-parse", "--verify", "--quiet", "REVERT_HEAD", check=False):
         return "revert"
+    if run_git(repo, "rev-parse", "--verify", "--quiet", "REBASE_HEAD", check=False):
+        return "rebase"
+    for rdir in ("rebase-merge", "rebase-apply"):
+        git_path_rel = run_git(repo, "rev-parse", "--git-path", rdir, check=False).strip()
+        if git_path_rel and (Path(repo) / git_path_rel).is_dir():
+            return "rebase"
     return "conflict"
+
 
 
 def list_conflicted_paths(repo: Path) -> list[str]:
     """Return a list of file paths that currently have unmerged stages."""
-    out = run_git(repo, "ls-files", "-u", check=False)
+    out = run_git(repo, "ls-files", "-u", "-z", check=False)
     paths: list[str] = []
-    for line in out.splitlines():
-        parts = line.split(maxsplit=3)
-        if len(parts) >= 4:
-            path = parts[3].strip()
-            if path not in paths:
+    for entry in out.split("\0"):
+        if not entry.strip():
+            continue
+        parts = entry.split("\t", 1)
+        if len(parts) >= 2:
+            path = parts[1].strip()
+            if path and path not in paths:
                 paths.append(path)
     return paths
 
@@ -94,6 +113,9 @@ def is_conflicted(repo: Path) -> bool:
 
 
 # ── git blame ─────────────────────────────────────────────────────────
+
+
+import difflib
 
 
 def blame_range(
@@ -118,8 +140,10 @@ def blame_range(
 
     commits: list[str] = []
     for line in out.splitlines():
+        if line.startswith("\t"):
+            continue
         parts = line.split()
-        if parts and len(parts[0]) == 40:
+        if parts and len(parts[0]) == 40 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
             sha = parts[0]
             if sha not in commits:
                 commits.append(sha)
@@ -129,15 +153,81 @@ def blame_range(
 # ── parsing hunks ─────────────────────────────────────────────────────
 
 
+def _map_hunk_range(
+    working_lines: list[str], stage_lines: list[str], w_start: int, w_end: int
+) -> tuple[int, int]:
+    """Map hunk line range [w_start, w_end) in working file to 1-based start..end in stage_lines."""
+    if w_start >= w_end or not stage_lines:
+        return 0, 0
+    matcher = difflib.SequenceMatcher(None, working_lines, stage_lines)
+    blocks = matcher.get_matching_blocks()
+    stage_indices: list[int] = []
+    for w_i in range(w_start, w_end):
+        for a, b, size in blocks:
+            if a <= w_i < a + size:
+                stage_indices.append(b + (w_i - a))
+                break
+    if stage_indices:
+        return min(stage_indices) + 1, max(stage_indices) + 1
+
+    # Fallback to nearest matching block before w_start
+    prev_end = 0
+    for a, b, size in blocks:
+        if a + size <= w_start:
+            prev_end = b + size
+        else:
+            break
+    s = prev_end + 1
+    e = min(len(stage_lines), prev_end + (w_end - w_start))
+    return s, e
+
+
 def parse_conflicted_file(
-    repo: Path, file_path: str, ours_head: str, theirs_head: Optional[str]
+    repo: Path,
+    file_path: str,
+    ours_head: str,
+    theirs_head: Optional[str],
+    operation: str = "conflict",
 ) -> ConflictedFile:
     """Parse conflict markers in *file_path* and attribute each side via git blame."""
+    disk_file = Path(repo) / file_path
+
+    # Detect binary conflict via numstat or NUL bytes
+    is_binary = False
+    numstat = run_git(repo, "diff", "--numstat", f":2:{file_path}", f":3:{file_path}", check=False)
+    if "-\t-" in numstat:
+        is_binary = True
+    if not is_binary and disk_file.is_file():
+        try:
+            chunk = disk_file.read_bytes()[:8192]
+            if b"\x00" in chunk:
+                is_binary = True
+        except OSError:
+            pass
+
+    if is_binary:
+        ours_commits = [ours_head] if ours_head else []
+        theirs_commits = [theirs_head] if theirs_head else []
+        hunk = ConflictHunk(
+            file_path=file_path,
+            ours=ConflictSide("ours", ("binary conflict: cannot show hunks",), tuple(ours_commits), 0, 0),
+            theirs=ConflictSide("theirs", ("binary conflict: cannot show hunks",), tuple(theirs_commits), 0, 0),
+            base_lines=(),
+        )
+        return ConflictedFile(
+            path=file_path,
+            hunks=(hunk,),
+            ours_head=ours_head,
+            theirs_head=theirs_head,
+            stage1_content=None,
+            stage2_content="",
+            stage3_content="",
+        )
+
     stage1 = run_git(repo, "show", f":1:{file_path}", check=False) or None
     stage2 = run_git(repo, "show", f":2:{file_path}", check=False)
     stage3 = run_git(repo, "show", f":3:{file_path}", check=False)
 
-    disk_file = Path(repo) / file_path
     if not disk_file.is_file():
         # Modify/delete conflict
         ours_commits = [ours_head] if ours_head else []
@@ -163,17 +253,28 @@ def parse_conflicted_file(
     except OSError:
         raw_lines = []
 
+    stage2_lines = stage2.splitlines() if stage2 else []
+    stage3_lines = stage3.splitlines() if stage3 else []
+
     hunks: list[ConflictHunk] = []
-    i2, i3 = 0, 0
     in_ours, in_base, in_theirs = False, False, False
     ours_lines: list[str] = []
     theirs_lines: list[str] = []
     base_lines: list[str] = []
-    ours_start, ours_label = 1, "HEAD"
-    theirs_start, theirs_label = 1, (theirs_head or "theirs")
+    ours_label = "HEAD (upstream)" if operation == "rebase" else "HEAD"
+    theirs_label = (
+        f"{theirs_head[:8]} (rebased)" if (theirs_head and operation == "rebase")
+        else ("rebased" if operation == "rebase" else (theirs_head or "theirs"))
+    )
+    w_ours_start = 0
+    w_ours_end = 0
+    w_theirs_start = 0
+    w_theirs_end = 0
 
-    for line in raw_lines:
-        if line.startswith("<<<<<<<"):
+    for idx, line in enumerate(raw_lines):
+        # Strict state transitions:
+        # <<<<<<< is valid only when NOT in a conflict
+        if (line.startswith("<<<<<<< ") or line == "<<<<<<<") and not (in_ours or in_base or in_theirs):
             in_ours = True
             in_base = False
             in_theirs = False
@@ -181,38 +282,57 @@ def parse_conflicted_file(
             theirs_lines = []
             base_lines = []
             parts = line.split(maxsplit=1)
-            ours_label = parts[1].strip() if len(parts) > 1 else "HEAD"
-            ours_start = i2 + 1
-        elif line.startswith("|||||||"):
+            raw_label = parts[1].strip() if len(parts) > 1 else "HEAD"
+            if operation == "rebase" and "upstream" not in raw_label:
+                ours_label = f"{raw_label} (upstream)"
+            else:
+                ours_label = raw_label
+            w_ours_start = idx + 1
+            w_ours_end = idx + 1
+        # ||||||| is valid only inside ours
+        elif (line.startswith("||||||| ") or line == "|||||||") and in_ours:
+            w_ours_end = idx
             in_ours = False
             in_base = True
             in_theirs = False
             base_lines = []
-        elif line.startswith("======="):
+        # ======= is valid only inside ours or base
+        elif (line.startswith("=======") or line == "=======") and (in_ours or in_base):
+            if in_ours:
+                w_ours_end = idx
             in_ours = False
             in_base = False
             in_theirs = True
             theirs_lines = []
-            theirs_start = i3 + 1
-        elif line.startswith(">>>>>>>"):
+            w_theirs_start = idx + 1
+            w_theirs_end = idx + 1
+        # >>>>>>> is valid only inside theirs
+        elif (line.startswith(">>>>>>> ") or line.startswith(">>>>>>>")) and in_theirs:
             in_ours = False
             in_base = False
             in_theirs = False
+            w_theirs_end = idx
             parts = line.split(maxsplit=1)
-            theirs_label = parts[1].strip() if len(parts) > 1 else (theirs_head or "theirs")
+            raw_theirs = parts[1].strip() if len(parts) > 1 else (theirs_head or "theirs")
+            if operation == "rebase" and "rebased" not in raw_theirs:
+                theirs_label = f"{raw_theirs} (rebased commit)"
+            else:
+                theirs_label = raw_theirs
 
-            ours_end = i2
-            theirs_end = i3
+
+            # Map line ranges into stage2 and stage3
+            ours_start, ours_end = _map_hunk_range(raw_lines, stage2_lines, w_ours_start, w_ours_end)
+            theirs_start, theirs_end = _map_hunk_range(raw_lines, stage3_lines, w_theirs_start, w_theirs_end)
 
             # Attribute commits via git blame
-            if ours_lines and ours_head:
+            if ours_lines and ours_head and ours_start > 0:
                 ours_commits = blame_range(repo, ours_head, file_path, ours_start, ours_end)
             elif ours_head:
                 ours_commits = [ours_head]
             else:
                 ours_commits = []
 
-            if theirs_lines and theirs_head:
+            if theirs_lines and theirs_head and theirs_start > 0:
                 theirs_commits = blame_range(repo, theirs_head, file_path, theirs_start, theirs_end)
             elif theirs_head:
                 theirs_commits = [theirs_head]
@@ -241,15 +361,13 @@ def parse_conflicted_file(
             )
         elif in_ours:
             ours_lines.append(line)
-            i2 += 1
+            w_ours_end = idx + 1
         elif in_base:
             base_lines.append(line)
         elif in_theirs:
             theirs_lines.append(line)
-            i3 += 1
-        else:
-            i2 += 1
-            i3 += 1
+            w_theirs_end = idx + 1
+
 
     return ConflictedFile(
         path=file_path,
@@ -273,7 +391,9 @@ def find_conflicts(repo: Path) -> Optional[ConflictState]:
     operation = get_conflict_type(repo)
 
     files = [
-        parse_conflicted_file(repo, p, ours_head=ours_head, theirs_head=theirs_head)
+        parse_conflicted_file(
+            repo, p, ours_head=ours_head, theirs_head=theirs_head, operation=operation
+        )
         for p in paths
     ]
 
@@ -283,3 +403,4 @@ def find_conflicts(repo: Path) -> Optional[ConflictState]:
         ours_head=ours_head,
         theirs_head=theirs_head,
     )
+

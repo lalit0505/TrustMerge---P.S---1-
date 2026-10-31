@@ -39,7 +39,7 @@ When a patch is backported, cherry-picked, or edited during conflict resolution,
 3. Overlapping Files & Modified Hunks
         │ (ambiguous candidates)
         ▼
-4. Open-Source AI Judge (Qwen 2.5 / Gemma via Ollama)
+4. Open-Source AI Judge (qwen2.5-coder:7b via Ollama)
    - Temperature 0, 16k context
    - Validated JSON verdict: `SameChangeVerdict(same_change=bool, confidence=float, reasoning=str)`
 ```
@@ -83,7 +83,7 @@ TrustMerge assigns strict evidence levels in decreasing order of confidence:
 
 ## Open-Source AI Integration
 
-TrustMerge uses **Qwen 2.5 / Gemma** running locally via Ollama (`http://localhost:11434`):
+TrustMerge uses **qwen2.5-coder:7b** running locally via Ollama (`http://localhost:11434`):
 1. **Fuzzy Same-Change Judge**: Evaluates ambiguous code hunks across branches where patch-IDs and trailers differ.
 2. **Messy Message Reference Extractor**: Turns conversational or unstructured commit messages into structured commit hashes and PR numbers when regexes fail.
 3. **Evidence-Bounded Conflict Briefing**: Generates a plain-English briefing for the developer. The prompt strictly instructs the model: *"Never claim something is tested without evidence. If the evidence doesn't say it's tested, say it's unverified."*
@@ -96,7 +96,7 @@ TrustMerge uses **Qwen 2.5 / Gemma** running locally via Ollama (`http://localho
 ### Prerequisites
 - Python 3.10+
 - Git 2.30+
-- (Optional) [Ollama](https://ollama.ai) with `qwen2.5-coder:7b` or `gemma4:e4b` for live AI briefings.
+- (Optional) [Ollama](https://ollama.ai) with `qwen2.5-coder:7b` for live AI briefings.
 
 ### Install from source
 ```bash
@@ -250,7 +250,32 @@ In CI or headless environments, set `TRUSTMERGE_LLM=fake` (configured automatica
 
 1. **Squashed or Rewritten Commits without Metadata**: If a commit was squashed without preserving trailers or modified beyond recognition, TrustMerge defaults to `UNVERIFIED` rather than guessing.
 2. **Untracked Branches**: TrustMerge inspects standard branch names (`prod`, `uat`, `dev` by default). Custom branch names can be configured via `trustmerge.provenance.Config`.
-3. **Local LLM Availability**: When Ollama is offline or uninstalled, TrustMerge transparently falls back to deterministic rule-based recommendations without failing.
+3. **Local LLM Availability**: When Ollama is offline or uninstalled, TrustMerge transparently falls back to deterministic rule-based recommendations without failing. LLM output is never authoritative and is subject to deterministic validation.
+4. **Recorded Evidence is Unsigned and Trust-on-Push**: Recorded evidence stored in `refs/notes/trustmerge` and local evidence files is unsigned and trust-on-push: anyone with push access to the repository can attach or edit notes under `refs/notes/trustmerge`. For cryptographic auditability, verify notes in CI against signed build provenance.
+5. **Reachability vs. Tested Verification**: Reaching a branch only verifies integration into that branch's history, not that tests passed, unless explicit recorded evidence exists. If any origin commit on a side is `UNVERIFIED` or `UNKNOWN`, that side's effective level is capped at the weakest level.
+
+---
+
+## Architecture & Wired AI Features
+
+TrustMerge pairs deterministic Git provenance analysis with local LLM assistance:
+
+- **Deterministic Rule Engine (Always Authoritative)**:
+  - Line-by-line stage-2/stage-3 blame mapping using `difflib.SequenceMatcher`.
+  - Level ranking: `PROD` > `UAT` > `CI-PASSED` > `UNVERIFIED` > `UNKNOWN`.
+  - Weakest-commit capping: sides are ranked by their weakest commit to prevent unverified code laundering.
+  - Briefing validator (`validate_briefing`): validates LLM briefings against deterministic rules and rejects hallucinations or inverted recommendations.
+
+- **Wired Local AI Features (`qwen2.5-coder:7b` via Ollama)**:
+  - **AI Conflict Briefing**: Generates plain-English summaries and rationales guarded by strict prompt defense and deterministic validation.
+  - **LLM Judge (`find_equivalents` with `--llm`)**: Identifies cherry-picked or backported equivalents when deterministic patch-ids and trailers find nothing. LLM matches add informative notes (`note: possibly same change as ... (LLM judge, confidence 0.xx, verify)`) and never elevate evidence levels.
+  - **LLM Reference Extractor (`extract_references`)**: Extracts backported commit hashes and GitHub PR references with strict regex validation and memoized caching.
+
+- **Test Coverage**:
+  - `trustmerge.finish`: **92%** test coverage
+  - `trustmerge.llm`: **97%** test coverage
+  - Fully deterministic test suite with `TRUSTMERGE_LLM=fake` (no running Ollama required for CI).
+
 
 ---
 

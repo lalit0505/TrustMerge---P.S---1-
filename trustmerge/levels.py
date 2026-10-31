@@ -15,10 +15,20 @@ RECORDABLE = {PROD, UAT, CI_PASSED}
 
 
 def rank(level: str) -> int:
-    """Return the ordinal position of *level* (lower = stronger)."""
-    return LEVEL_ORDER.index(level)
+    """Return the ordinal position of *level* (lower = stronger).
+
+    Unknown levels return a high number (ignored / weakest) without raising.
+    """
+    if not isinstance(level, str):
+        return 999
+    norm = level.upper().replace("_", "-")
+    try:
+        return LEVEL_ORDER.index(norm)
+    except ValueError:
+        return 999
 
 
 def stronger(a: str, b: str) -> str:
     """Return whichever of *a* and *b* represents stronger evidence."""
     return a if rank(a) <= rank(b) else b
+

@@ -38,15 +38,38 @@ def short(sha: str) -> str:
 
 
 def resolve_ref(repo: Path, name: str) -> Optional[str]:
-    """Return a full refname for *name* (local first, then remote), or ``None``."""
-    for ref in (f"refs/heads/{name}", f"refs/remotes/origin/{name}"):
-        out = run_git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
-        if out:
-            return ref
+    """Return a full refname for *name* (local vs origin: prefers descendant; if diverged prefers origin), or ``None``."""
+    local_ref = f"refs/heads/{name}"
+    remote_ref = f"refs/remotes/origin/{name}"
+
+    local_sha = run_git(repo, "rev-parse", "--verify", "--quiet", local_ref, check=False)
+    remote_sha = run_git(repo, "rev-parse", "--verify", "--quiet", remote_ref, check=False)
+
+    if local_sha and remote_sha:
+        # Both exist: check descendant relationship
+        if is_ancestor(repo, remote_ref, local_ref) and not is_ancestor(repo, local_ref, remote_ref):
+            # local is strictly ahead of remote
+            return local_ref
+        elif is_ancestor(repo, local_ref, remote_ref):
+            # remote is ahead of local (or equal)
+            return remote_ref
+        else:
+            # diverged: prefer origin
+            return remote_ref
+    elif local_sha:
+        return local_ref
+    elif remote_sha:
+        return remote_ref
     return None
 
 
-def infer_evidence(repo: Path, sha: str, config: Config = Config()) -> Evidence:
+def infer_evidence(
+    repo: Path,
+    sha: str,
+    config: Config = Config(),
+    use_llm: bool = False,
+    client: Optional[object] = None,
+) -> Evidence:
     """Determine the evidence level for *sha* using only Git data (no notes)."""
     sha = rev_parse(repo, sha)
     environments = [(PROD, config.prod), (UAT, config.uat), (None, config.dev)]
@@ -54,6 +77,7 @@ def infer_evidence(repo: Path, sha: str, config: Config = Config()) -> Evidence:
     reached: list[str] = []
     related: list[str] = []
 
+    found_deterministic = False
     for level, name in environments:
         ref = resolve_ref(repo, name)
         if ref is None:
@@ -63,20 +87,46 @@ def infer_evidence(repo: Path, sha: str, config: Config = Config()) -> Evidence:
         if is_ancestor(repo, sha, ref):
             detail = f"reachable from {name}"
 
-        for match in find_equivalents(repo, sha, [ref], max_commits=config.max_commits):
+        for match in find_equivalents(
+            repo, sha, [ref], max_commits=config.max_commits, use_llm=False
+        ):
             if match.method == "patch-id" and detail is None:
                 detail = f"identical change {short(match.commit)} is on {name}"
+                found_deterministic = True
             elif match.method == "reference" and level is not None:
                 related.append(
                     f"same logical change as {short(match.commit)} on {name}"
                     " (code may differ, verify separately)"
                 )
+                found_deterministic = True
 
         if detail is None:
             continue
         reached.append(name)
         if level is not None and chosen is None:
             chosen = (level, detail)
+
+    # If deterministic matching found no equivalent and LLM is enabled, call LLM judge
+    if not found_deterministic and use_llm:
+        for level, name in environments:
+            ref = resolve_ref(repo, name)
+            if ref is None:
+                continue
+            llm_matches = find_equivalents(
+                repo,
+                sha,
+                [ref],
+                max_commits=config.max_commits,
+                use_llm=True,
+                max_llm_candidates=5,
+                client=client,  # type: ignore[arg-type]
+            )
+            for m in llm_matches:
+                if m.method == "llm-judge":
+                    related.append(
+                        f"possibly same change as {short(m.commit)} (LLM judge, confidence {m.confidence:.2f}, verify)"
+                    )
+                    # An LLM match must NEVER raise the evidence level; it only adds a note.
 
     if chosen is not None:
         return Evidence(
@@ -96,24 +146,32 @@ def infer_evidence(repo: Path, sha: str, config: Config = Config()) -> Evidence:
     )
 
 
-def assess(repo: Path, sha: str, config: Config = Config()) -> Evidence:
+def assess(
+    repo: Path,
+    sha: str,
+    config: Config = Config(),
+    use_llm: bool = False,
+    client: Optional[object] = None,
+) -> Evidence:
     """Public entry-point: return evidence for *sha*.
 
     Checks recorded git notes and evidence files first.
     Falls back to Git inference when no recorded evidence is present.
     """
     sha = rev_parse(repo, sha)
-    inferred = infer_evidence(repo, sha, config)
+    inferred = infer_evidence(repo, sha, config, use_llm=use_llm, client=client)
     recorded = get_recorded_evidence(repo, sha)
-    if not recorded:
+    valid_recorded = [r for r in recorded if rank(r.level) < 999]
+    if not valid_recorded:
         return inferred
 
     # Pick the strongest recorded evidence
     best = min(
-        recorded,
-        key=lambda r: rank(r.level.upper()) if r.level.upper() in LEVEL_ORDER else 999,
+        valid_recorded,
+        key=lambda r: rank(r.level),
     )
-    rec_level = best.level.upper()
+    rec_level = best.level.upper().replace("_", "-")
+
 
     if rank(rec_level) <= rank(inferred.level):
         return Evidence(

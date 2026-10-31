@@ -230,3 +230,101 @@ def test_cli_sync_missing_remote(scenario):
     res = runner.invoke(app, ["sync", "--remote", "nonexistent", "--repo", str(scenario.repo)])
     assert res.exit_code == 1
     assert "Remote 'nonexistent' not found." in res.output
+
+
+def test_regression_c1_read_note_cat_sort_uniq_multiline(scenario):
+    repo = scenario.repo
+    sha = scenario.dev_change
+
+    # Simulate cat_sort_uniq multiline output (several JSON lists)
+    raw = (
+        '[{"level": "UAT", "evidence": "run-1"}]\n'
+        '[{"level": "PROD", "evidence": "run-2"}]\n'
+    )
+    git(repo, "notes", "--ref", NOTES_REF, "add", "-f", "-m", raw, sha)
+
+    records = read_note(repo, sha)
+    assert records is not None
+    assert len(records) == 2
+    assert NoteRecord(level="UAT", evidence="run-1") in records
+    assert NoteRecord(level="PROD", evidence="run-2") in records
+
+
+def test_regression_c1_sync_all_cases(tmp_path):
+    bare = tmp_path / "central.git"
+    git(tmp_path, "init", "--bare", str(bare))
+
+    repo_a = tmp_path / "clone_a"
+    git(tmp_path, "clone", "-q", str(bare), str(repo_a))
+    git(repo_a, "config", "user.name", "User A")
+    git(repo_a, "config", "user.email", "a@example.com")
+    (repo_a / "f1.txt").write_text("file 1\n")
+    git(repo_a, "add", "f1.txt")
+    git(repo_a, "commit", "-m", "Commit 1")
+    sha1 = git(repo_a, "rev-parse", "HEAD").stdout.strip()
+    (repo_a / "f2.txt").write_text("file 2\n")
+    git(repo_a, "add", "f2.txt")
+    git(repo_a, "commit", "-m", "Commit 2")
+    sha2 = git(repo_a, "rev-parse", "HEAD").stdout.strip()
+    git(repo_a, "push", "origin", "HEAD:main")
+
+    repo_b = tmp_path / "clone_b"
+    git(tmp_path, "clone", "-q", str(bare), str(repo_b))
+    git(repo_b, "config", "user.name", "User B")
+    git(repo_b, "config", "user.email", "b@example.com")
+
+    # (a) No local notes and no remote notes -> succeed with message "nothing to sync"
+    res_a = runner.invoke(app, ["sync", "--repo", str(repo_a)])
+    assert res_a.exit_code == 0
+    assert "nothing to sync" in res_a.output.lower()
+
+    # (b) Local notes only -> push
+    write_note(repo_a, sha1, NoteRecord(level="UAT", evidence="qa-run-1"))
+    res_b = runner.invoke(app, ["sync", "--repo", str(repo_a)])
+    assert res_b.exit_code == 0
+    assert "synchronized notes" in res_b.output.lower()
+    # Bare remote now has notes ref
+    bare_notes = git(bare, "rev-parse", "--verify", "--quiet", NOTES_REF).stdout.strip()
+    assert bare_notes
+
+    # (c) Remote notes only -> fetch
+    assert read_note(repo_b, sha1) is None
+    res_c = runner.invoke(app, ["sync", "--repo", str(repo_b)])
+    assert res_c.exit_code == 0
+    assert "synchronized notes" in res_c.output.lower()
+    assert read_note(repo_b, sha1) == [NoteRecord(level="UAT", evidence="qa-run-1")]
+
+    # (d) DIVERGED notes from two people marking different commits
+    # User A marks sha1 with another note and pushes
+    write_note(repo_a, sha1, NoteRecord(level="PROD", evidence="prod-run-a"))
+    res_a_push = runner.invoke(app, ["sync", "--repo", str(repo_a)])
+    assert res_a_push.exit_code == 0
+
+    # User B (without pulling User A's new note) marks sha2 with a note
+    write_note(repo_b, sha2, NoteRecord(level="CI-PASSED", evidence="ci-run-b"))
+
+    # User B syncs: diverged!
+    res_b_sync = runner.invoke(app, ["sync", "--repo", str(repo_b)])
+    assert res_b_sync.exit_code == 0
+    assert "synchronized notes" in res_b_sync.output.lower()
+
+    # User B now has both notes
+    notes_b_sha1 = read_note(repo_b, sha1)
+    notes_b_sha2 = read_note(repo_b, sha2)
+    assert any(n.level == "PROD" for n in notes_b_sha1)
+    assert any(n.level == "CI-PASSED" for n in notes_b_sha2)
+
+    # User A syncs to get the merged result
+    res_a_sync = runner.invoke(app, ["sync", "--repo", str(repo_a)])
+    assert res_a_sync.exit_code == 0
+    notes_a_sha2 = read_note(repo_a, sha2)
+    assert any(n.level == "CI-PASSED" for n in notes_a_sha2)
+
+    # Error handling: remote communication failure must NOT be silently ignored
+    broken_repo = tmp_path / "broken"
+    git(tmp_path, "clone", "-q", str(bare), str(broken_repo))
+    git(broken_repo, "remote", "set-url", "origin", "file:///nonexistent/repo.git")
+    res_err = runner.invoke(app, ["sync", "--repo", str(broken_repo)])
+    assert res_err.exit_code == 1
+    assert "sync error" in res_err.output.lower()
+

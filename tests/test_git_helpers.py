@@ -50,3 +50,10 @@ def test_patch_id_differs_for_edited_backport(scenario):
     assert patch_id(scenario.repo, scenario.hotfix) != patch_id(
         scenario.repo, scenario.backport
     )
+
+
+def test_regression_b7_patch_id_empty_commit(scenario):
+    empty_sha = run_git(scenario.repo, "commit", "--allow-empty", "-m", "empty")
+    empty_sha = run_git(scenario.repo, "rev-parse", "HEAD")
+    assert patch_id(scenario.repo, empty_sha) == ""
+
