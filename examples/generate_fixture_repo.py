@@ -31,6 +31,9 @@ def commit_file(repo: Path, filename: str, content: str, message: str) -> str:
 
 
 def build_repo(path: Path) -> Path:
+    if path.exists():
+        import shutil
+        shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
     git(path, "init", "-b", "prod")
     git(path, "config", "user.name", "TrustMerge Demo")
